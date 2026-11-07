@@ -277,6 +277,25 @@ test('non-edition games fall back to normal base/update packing', async (t) => {
   assert.equal(packages[0].tags.get(5).toString(), data.control.name);
 });
 
+test('base and matching update packages carry their own control metadata', async (t) => {
+  const data = fixture();
+  data.views = data.views.filter((view) => !view.path.startsWith('/switch2/') && !view.path.startsWith('/dlc/'));
+  const updateControl = { name: 'Updated game', publisher: 'Publisher', version: '2.0.0',
+    nacp: Buffer.alloc(0x4000, 3), icon: Buffer.from('update icon') };
+  data.updateControls = { [baseId + ':720896']: updateControl };
+  const server = await ftpServer(t, data.files);
+  const output = path.join(await directory(t), 'game.nup');
+  await packNup({ ...server, ...data, title: baseId, output });
+  const packages = readArchive(await fs.readFile(output));
+  assert.equal(packages.find((pack) => pack.kind === 0).tags.get(5).toString(), data.control.name);
+  const update = packages.find((pack) => pack.kind === 1);
+  assert.deepEqual(update.tags.get(2), updateControl.nacp);
+  assert.deepEqual(update.tags.get(3), updateControl.icon);
+  assert.equal(update.tags.get(4).toString(), updateControl.version);
+  assert.equal(update.tags.get(5).toString(), updateControl.name);
+  assert.equal(update.tags.get(6).toString(), updateControl.publisher);
+});
+
 test('missing Switch 2 executable files abort packing before connecting or creating output', async (t) => {
   const dir = await directory(t);
   for (const edition of ['switch2', 'both', 'all']) {

@@ -421,7 +421,7 @@ async function main(argv = process.argv.slice(2)) {
       if (nup) {
         ui?.setStage('Downloading and packing');
         console.log('FTP up at ' + host + ':' + port + ', downloading into ' + nup);
-        await packNup({ host, port, views: prepared.views, title, name, output: nup, edition, control: prepared.control, shouldStop,
+        await packNup({ host, port, views: prepared.views, title, name, output: nup, edition, control: prepared.control, updateControls: prepared.updateControls, shouldStop,
           onProgress: ui ? (progress) => ui.progress(progress) : undefined });
         completed = true;
         ui?.setStage('Cleaning up the console');

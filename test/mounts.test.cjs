@@ -186,8 +186,20 @@ test('key-card icon fallback takes the whole control, NACP included, from its ma
   assert.equal(prepared.control.name, update.name);
   assert.equal(prepared.control.icon, update.icon);
   assert.equal(prepared.control.iconSource, iconSource);
+  assert.equal(prepared.updateControls['0400e140216d4800:' + patch.version], update);
+  assert.equal(controls.length, 2, 'fallback control is reused for the update package');
   assert.deepEqual(controls[1], { title: cardTitle, storages: [4],
     options: { update: { contentTitle: '0400e140216d4800', version: patch.version } } });
+});
+
+test('update control is read even when the base has an icon', async (t) => {
+  const base = { name: 'Base', icon: Buffer.from('base') };
+  const update = { name: 'Update', icon: Buffer.from('update') };
+  const f = fixture(t, { readControl: async (attachment, title, storages, options) => options?.update ? update : base });
+  const prepared = await f.run({ images: true });
+  assert.equal(prepared.control.name, base.name);
+  assert.equal(prepared.control.icon, base.icon);
+  assert.equal(prepared.updateControls[patch.contentTitle + ':' + patch.version], update);
 });
 
 test('license preparation failure retains the mount, selected source and original FS error', async (t) => {

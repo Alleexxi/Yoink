@@ -478,6 +478,7 @@ function planPackages(views, title, edition = 'switch2') {
             ? patchedAddonId(source)
             : source.contentTitle || title,
       version: source.version >>> 0,
+      controlKey: source.contentTitle + ':' + source.version,
       flags: 0,
       root,
       exefsDir: null,
@@ -538,14 +539,16 @@ function tlv(type, payload) {
 }
 
 // same records (sorted by type) as the reference packer (a55uka/nup), so `nup edit` etc. treat them the same
-function buildMeta(pack, { npdm, mainHead, name, control }) {
+function buildMeta(pack, { npdm, mainHead, name, control, updateControls }) {
   const records = [];
-  if (pack.switch2 && control?.switch2) control = control.switch2;
+  if (pack.switch2) control = control?.switch2 || control;
+  else if (pack.kind === KIND.update) control = updateControls?.[pack.controlKey] || null;
+  else if (pack.kind !== KIND.base) control = null;
 
   if (npdm) records.push(tlv(0x0001, npdm));
 
   // A separate edition program carries its own Control data; flattened editions are base packages.
-  if (pack.kind === KIND.base || pack.switch2) {
+  if (pack.kind === KIND.base || pack.switch2 || (pack.kind === KIND.update && control)) {
     if (control?.nacp) records.push(tlv(0x0002, control.nacp));
     if (control?.icon) records.push(tlv(0x0003, control.icon));
     if (control?.version) records.push(tlv(0x0004, Buffer.from(control.version)));
@@ -841,7 +844,7 @@ function editionOutputs(output, edition) {
   ];
 }
 
-async function packNup({ host, port, views, title, name, output, edition = 'switch2', control = null, shouldStop = () => false, onProgress }) {
+async function packNup({ host, port, views, title, name, output, edition = 'switch2', control = null, updateControls = {}, shouldStop = () => false, onProgress }) {
   const targets = editionOutputs(output, edition).map((target) => {
     const packages = planPackages(views, title, target.edition);
     const plan = layout(packages);
@@ -917,7 +920,7 @@ async function packNup({ host, port, views, title, name, output, edition = 'swit
         if (pack.kind === KIND.base || pack.kind === KIND.update) {
           pack.titleId = npdmProgramId(pack.npdm) || pack.titleId;
         }
-        pack.metaBlock = buildMeta(pack, { npdm: pack.npdm || null, mainHead: pack.mainHead || null, name, control });
+        pack.metaBlock = buildMeta(pack, { npdm: pack.npdm || null, mainHead: pack.mainHead || null, name, control, updateControls });
       }
 
       // a nup keys packages by (title id, version, kind); two in one file that share all three would

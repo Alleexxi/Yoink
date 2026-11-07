@@ -704,6 +704,7 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
 
   // the control content (NACP + icon) names the title and lets a loader register it
   let control = null;
+  const updateControls = {};
   if (images) {
     cancelled();
     try {
@@ -723,6 +724,7 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
           const updateControl = await readControl(a, title, patchGroup.map((item) => item.storage), {
             update: { contentTitle: update.contentTitle, version: update.version },
           });
+          updateControls[update.contentTitle + ':' + update.version] = updateControl;
           // the update's whole control (NACP, name, version, publisher) goes with its icon
           if (updateControl && (!control || updateControl.icon)) control = updateControl;
           if (updateControl?.icon && control?.iconSource?.selection === 'update') {
@@ -735,6 +737,20 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
     } catch (error) {
       if (!error.nativeResult) throw error;
       console.log('Could not read control content: ' + error.message);
+    }
+    for (const group of updateGroups) {
+      const update = group[0];
+      const key = update.contentTitle + ':' + update.version;
+      if (Object.hasOwn(updateControls, key)) continue;
+      cancelled();
+      try {
+        updateControls[key] = await readControl(a, title, group.map((item) => item.storage), {
+          update: { contentTitle: update.contentTitle, version: update.version },
+        });
+      } catch (error) {
+        if (!error.nativeResult) throw error;
+        console.log('Could not read update control v' + update.version + ': ' + error.message);
+      }
     }
   }
 
@@ -877,7 +893,7 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
     }
   }
 
-  return { index: buildIndex(views, { images }), sources, views, control };
+  return { index: buildIndex(views, { images }), sources, views, control, updateControls };
 }
 
 // --probe: open each add-on data patch the way prepareGame does and summarize what FS hands back
