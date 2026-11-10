@@ -1,6 +1,7 @@
 #ifndef NS2_FTP_NATIVE_H
 #define NS2_FTP_NATIVE_H
 #define FTP_MAX_CLIENTS 12
+enum {FTP_CONFIG=1,FTP_SOCKET,FTP_BIND,FTP_LISTEN,FTP_RUNNING,FTP_STOPPING,FTP_STOPPED};
 typedef unsigned char u8;
 typedef unsigned short u16;
 typedef unsigned int u32;

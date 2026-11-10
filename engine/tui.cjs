@@ -112,8 +112,11 @@ class TerminalUI {
     pending?.(value);
   }
 
-  chooseGame(games) {
+  chooseGame(games, { multiple = false, selected = [] } = {}) {
     this.games = games;
+    this.multiple = multiple;
+    this.marked = new Set(selected.map((game) => game.title));
+    this.error = '';
     this.query = '';
     this.searching = false;
     this.selected = 0;
@@ -128,9 +131,10 @@ class TerminalUI {
     return this.wait();
   }
 
-  configure({ game, output, edition }) {
+  configure({ game, output, edition, games = null }) {
     this.game = game;
-    this.outputFile = output || defaultOutput(game);
+    this.batchGames = games;
+    this.outputFile = output || (games ? path.resolve('dumps') : defaultOutput(game));
     this.action = 'nup';
     this.edition = edition;
     this.field = 0;
@@ -138,6 +142,12 @@ class TerminalUI {
     this.error = '';
     this.mode = 'options';
     return this.wait();
+  }
+
+  configureBatch({ games, outputDir, edition }) {
+    return this.configure({ games, output: outputDir, edition,
+      game: { ...games[0], name: games.length + ' selected games',
+        switch2Edition: games.some((game) => game.switch2Edition) } });
   }
 
   done(stage = 'Dump complete') {
@@ -178,7 +188,17 @@ class TerminalUI {
         if (key.name === 'home') this.selected = 0;
         if (key.name === 'end') this.selected = games.length - 1;
         this.selected = Math.max(0, Math.min(this.selected, games.length - 1));
-        if (key.name === 'return' && games[this.selected]) { this.game = games[this.selected]; this.resolve(this.game); return; }
+        if (key.name === 'space' && games[this.selected]) {
+          const title = games[this.selected].title;
+          if (this.marked.has(title)) this.marked.delete(title);
+          else this.marked.add(title);
+          this.error = '';
+        }
+        if (key.name === 'return') {
+          if (this.marked.size) { this.resolve(this.games.filter((game) => this.marked.has(game.title))); return; }
+          if (this.multiple) this.error = 'Press Space to select at least one game.';
+          else if (games[this.selected]) { this.game = games[this.selected]; this.resolve(this.game); return; }
+        }
       }
     } else if (this.mode === 'options') {
       if (this.editing) {
@@ -193,14 +213,22 @@ class TerminalUI {
         if (key.name === 'up' || key.name === 'tab' && key.shift) this.field = (this.field + 3) % 4;
         if (['left', 'right', 'return', 'space'].includes(key.name)) {
           const direction = key.name === 'left' ? -1 : 1;
-          if (this.field === 0) this.action = this.action === 'nup' ? 'ftp' : 'nup';
+          if (this.field === 0 && !this.batchGames) this.action = this.action === 'nup' ? 'ftp' : 'nup';
           else if (this.field === 1 && key.name === 'return' && this.action === 'nup') {
             this.beforeEdit = this.outputFile; this.editing = true;
           } else if (this.field === 2 && this.game.switch2Edition) {
             this.edition = editions[(editions.indexOf(this.edition) + direction + editions.length) % editions.length];
           } else if (this.field === 3 && key.name === 'return') {
             const output = path.resolve(this.outputFile.trim() || '.');
-            if (this.action === 'nup' && (!this.outputFile.trim() || !/\.nup$/i.test(output))) this.error = 'Choose an output filename ending in .nup.';
+            if (this.batchGames) {
+              if (!this.outputFile.trim()) this.error = 'Choose an output folder.';
+              else {
+                try {
+                  if (fs.existsSync(output) && !fs.statSync(output).isDirectory()) this.error = 'The output path is not a folder.';
+                  else { this.resolve({ outputDir: output, edition: this.edition }); return; }
+                } catch (error) { this.error = error.message; }
+              }
+            } else if (this.action === 'nup' && (!this.outputFile.trim() || !/\.nup$/i.test(output))) this.error = 'Choose an output filename ending in .nup.';
             else if (this.action === 'nup' && !fs.existsSync(path.dirname(output))) this.error = 'The output folder does not exist.';
             else { this.resolve({ nup: this.action === 'nup' ? output : undefined, edition: this.edition }); return; }
           }
@@ -247,34 +275,36 @@ class TerminalUI {
     } else if (this.mode === 'games') {
       const games = this.filtered();
       add(' LIBRARY  /  ' + games.length + ' of ' + this.games.length + ' games');
+      add(this.multiple || this.marked.size ? ' BATCH  /  ' + this.marked.size + ' selected' : ' Space marks games for a batch', '36');
       add(' Search: ' + (this.query || (this.searching ? '' : 'press / to filter')) + (this.searching ? '▏' : ''), this.searching ? '36' : '90');
       add();
-      this.pageSize = Math.max(1, height - 12);
+      this.pageSize = Math.max(1, height - 13);
       const start = Math.max(0, Math.min(this.selected - Math.floor(this.pageSize / 2), games.length - this.pageSize));
       for (let i = start; i < Math.min(games.length, start + this.pageSize); i++) {
         const game = games[i];
-        add(' ' + (i === this.selected ? '› ' : '  ') + (game.switch2Edition ? '[S2 Edition] ' : game.title.startsWith('04') ? '[Switch 2] ' : '[Switch] ') + (game.name || game.title), i === this.selected ? '30;46' : undefined);
+        add(' ' + (i === this.selected ? '› ' : '  ') + (this.marked.has(game.title) ? '[x] ' : '[ ] ') + (game.switch2Edition ? '[S2 Edition] ' : game.title.startsWith('04') ? '[Switch 2] ' : '[Switch] ') + (game.name || game.title), i === this.selected ? '30;46' : undefined);
       }
       if (!games.length) add(' No games match your search.', '90');
       while (rows.length < height - 6) add();
       const selected = games[this.selected];
       add(selected ? ' ' + selected.title.toUpperCase() + '  ·  ' + selected.storages.map((id) => storages[id]).join(', ') : '');
-      add(selected?.switch2Edition ? ' Switch 2 Edition program installed' : '');
-      footer = this.searching ? ' Type to filter  ·  Enter apply  ·  Esc clear' : ' ↑↓ select  ·  / search  ·  Enter choose  ·  q quit';
+      add(this.error || (selected?.switch2Edition ? ' Switch 2 Edition program installed' : ''), this.error ? '33' : undefined);
+      footer = this.searching ? ' Type to filter  ·  Enter apply  ·  Esc clear' : ' ↑↓ · Space mark · Enter next · / search · q quit';
     } else if (this.mode === 'options') {
-      add(' DUMP SETUP', '1');
+      add(this.batchGames ? ' BATCH DUMP SETUP' : ' DUMP SETUP', '1');
       add(' ' + (this.game.name || this.game.title), '36');
       add();
       const field = (index, label, value) => add(' ' + (this.field === index ? '› ' : '  ') + label + '  ' + value, this.field === index ? '30;46' : undefined);
-      field(0, 'Action ', this.action === 'nup' ? '‹ Save NUP ›' : '‹ Serve FTP ›');
-      field(1, 'Output ', this.action === 'nup' ? this.outputFile + (this.editing ? '▏' : '') : 'Connect using your own FTP client');
+      field(0, 'Action ', this.batchGames ? 'Save a NUP per game' : this.action === 'nup' ? '‹ Save NUP ›' : '‹ Serve FTP ›');
+      field(1, this.batchGames ? 'Folder ' : 'Output ', this.action === 'nup' ? this.outputFile + (this.editing ? '▏' : '') : 'Connect using your own FTP client');
       field(2, 'Edition', this.game.switch2Edition ? '‹ ' + editionNames[editions.indexOf(this.edition)] + ' ›' : 'Standard game');
       add();
-      field(3, '', this.action === 'nup' ? 'Start dump →' : 'Start FTP →');
+      field(3, '', this.batchGames ? 'Start batch →' : this.action === 'nup' ? 'Start dump →' : 'Start FTP →');
       add(this.error ? ' ' + this.error : '', '33');
       footer = this.editing ? ' Type path  ·  Ctrl+U clear  ·  Enter save  ·  Esc undo' : ' ↑↓ fields  ·  ←→ change  ·  Enter edit/start  ·  Esc back';
     } else {
       add(' ' + this.stage.toUpperCase(), '1;36');
+      if (this.batch) add(' Batch ' + this.batch.index + '/' + this.batch.total + '  ·  ' + this.batch.completed + ' completed', '36');
       add(' ' + (this.game?.name || this.game?.title || 'Keep SmileBASIC and the RPC connection open.'));
       if (this.host) add(' Console  ' + this.host);
       if (this.outputFile) add(' Output   ' + this.outputFile);

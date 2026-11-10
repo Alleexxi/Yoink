@@ -146,6 +146,17 @@ const MAX_CLIENTS = 12;
 
 const align = (n) => Math.ceil(n / 4096) * 4096;
 
+function startupError({ result, phase, nativeResult }, port) {
+  const stages = { 1: 'configuration/index validation', 2: 'socket creation', 3: 'bind', 4: 'listen',
+    5: 'server loop', 6: 'shutdown', 7: 'shutdown' };
+  const stage = stages[phase] || 'unknown stage';
+  const socketError = phase >= 2 && phase <= 4 && nativeResult ? ', socket errno ' + nativeResult : '';
+  let message = 'Native FTP startup failed during ' + stage + ': 0x' + result.toString(16) + socketError;
+  if (phase === 3) message += '\nCould not bind port ' + port +
+    '. A live server or recently closed connection may still occupy it. Try another --port.';
+  return new Error(message);
+}
+
 async function readImage() {
   return fs.readFile(path.join(__dirname, 'oz-code/native.bin'));
 }
@@ -234,6 +245,8 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
     return {
       state: data.readUInt32LE(16),
       result: data.readUInt32LE(20),
+      nativeResult: Number(data.readBigUInt64LE(48)),
+      phase: data.readUInt32LE(60),
     };
   }
 
@@ -251,7 +264,9 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
         await new Promise((r) => setTimeout(r, 50));
       }
 
+      if (!stopped) throw new Error('Native FTP did not stop within 10 seconds; restart the console application before another dump');
       const joined = await work.rpc.call3(a.live.sdk + threadCode.join.offset, worker, work.base + 0xa008, 0);
+      if (joined) throw new Error('Could not join the stopped native FTP worker: 0x' + Number(joined).toString(16));
       work.threads.delete(worker);
       a.s.threads.delete('standalone-ftp');
       worker = undefined;
@@ -350,20 +365,17 @@ async function deployFtp({ attachment: a, image, index, sources, port }) {
       if (current.state === 1) break;
 
       if (current.state === 3) {
-        throw new Error(
-          'Native FTP startup failed: 0x' + current.result.toString(16) +
-            '\nIs port ' + port + ' still taken? An earlier Yoink server that wasn\'t stopped with Ctrl-C ' +
-            'keeps running until the game is closed. Try another --port.',
-        );
+        throw startupError(current, port);
       }
 
       await new Promise((r) => setTimeout(r, 50));
     }
 
+    if (current.state !== 1) throw new Error('Native FTP did not become ready within 10 seconds');
     return { close };
   } catch (error) {
     await cleanup([close], error);
   }
 }
 
-module.exports = { deployFtp, readImage };
+module.exports = { deployFtp, readImage, startupError };
