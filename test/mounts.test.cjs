@@ -202,6 +202,25 @@ test('update control is read even when the base has an icon', async (t) => {
   assert.equal(prepared.updateControls[patch.contentTitle + ':' + patch.version], update);
 });
 
+test('missing base control uses the update NACP even when neither has an icon', async (t) => {
+  const update = { name: 'Update', nacp: Buffer.alloc(0x4000, 2), icon: null };
+  const f = fixture(t, { missingProgram: true,
+    readControl: async (attachment, title, storages, options) => options?.update ? update : null });
+  const prepared = await f.run({ images: true });
+  assert.equal(prepared.control, update);
+  assert.equal(prepared.updateControls[patch.contentTitle + ':' + patch.version], update);
+});
+
+test('an update without an icon preserves existing base control', async (t) => {
+  const base = { name: 'Base', nacp: Buffer.alloc(0x4000, 1), icon: null };
+  const update = { name: 'Update', nacp: Buffer.alloc(0x4000, 2), icon: null };
+  const f = fixture(t, { missingProgram: true,
+    readControl: async (attachment, title, storages, options) => options?.update ? update : base });
+  const prepared = await f.run({ images: true });
+  assert.equal(prepared.control, base);
+  assert.equal(prepared.updateControls[patch.contentTitle + ':' + patch.version], update);
+});
+
 test('license preparation failure retains the mount, selected source and original FS error', async (t) => {
   const baseFailure = resultError('Open selected game CodeFS', 0x7d802);
   const licenseFailure = Object.assign(new Error('Requires original content'), {

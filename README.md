@@ -110,9 +110,39 @@ storage, content ID, NCA path, size, file counts, and available Control/NACP/ico
 details. It does not start FTP or write a NUP. Leave out the title ID to select a
 game from the library.
 
+### Batch dumps
+
+In the library, press **Space** to mark each game you want, then **Enter** to open
+batch setup. Marks stay selected while you search. Choose an output folder and
+edition, then start the queue. Enter without marking any games keeps the normal
+single-game setup.
+
+You can also launch the picker in batch mode explicitly:
+
+```bash
+node yoink.cjs --batch --output-dir ./dumps
+```
+
+With `--no-tui`, enter game numbers separated by commas or spaces, such as `1,3,5`.
+The default batch folder is `./dumps`; missing folders are created. Each file is
+named `Game name [TITLE_ID].nup`, so games with the same name get separate outputs.
+`--edition both` writes the usual `-switch2.nup` companion for each game.
+
+Games run one at a time, with a fresh console attachment and FTP cleanup between
+them. The queue stops on the first dump or cleanup error, or when you press `q` /
+Ctrl+C. Completed files are kept. Existing NUPs or partial files cause the batch
+to stop rather than overwrite them; choose a different folder or move those files
+before retrying. The game card must remain inserted for any selected card game.
+
+The FTP listener enables address reuse for sequential restarts on the same port.
+Startup failures report the failing stage and socket errno when available, rather
+than assuming every failure means a port conflict.
+
 ## Development
 
 Run `npm test` for the local FTP and NUP packing tests; no console is needed.
+The native FTP restart regression test also runs when a host C compiler (`cc`,
+`gcc` or `clang`) is available; otherwise that test is skipped.
 Run `npm run build` to rebuild the bundled native FTP server. This needs either the
 AArch64 GNU toolchain or Clang, LLD and llvm-objcopy on PATH.
 

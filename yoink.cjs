@@ -11,6 +11,7 @@ const { packNup } = require('./engine/nup.cjs');
 const { getConsoleIp } = require('./engine/network.cjs');
 const { TerminalUI, supportsTui } = require('./engine/tui.cjs');
 const { resolveRun } = require('./engine/runtime.cjs');
+const { dumpBatch, parseBatchSelection } = require('./engine/batch.cjs');
 
 const USAGE = 'Usage: node yoink.cjs [run-directory|runs-directory] [title-id] [--port 2121] [--nup <out.nup>] [--ip <switch 2 ip>] [--edition switch2]\n' +
               '       node yoink.cjs debug [run-directory|runs-directory] [title-id]\n' +
@@ -19,6 +20,8 @@ const USAGE = 'Usage: node yoink.cjs [run-directory|runs-directory] [title-id] [
               'With --nup, Yoink downloads everything itself and writes a .nup instead of leaving the FTP up\n' +
               'The console IP is detected through RPC; --ip overrides it for --nup downloads\n' +
               'Interactive terminals open the TUI; --no-tui uses the plain-text interface\n' +
+              '--batch selects several games for sequential NUP dumps; --output-dir <folder> chooses their folder\n' +
+              'In the TUI, Space marks games for a batch and Enter opens batch setup\n' +
               '--edition picks how a Switch 2 Edition is packed: switch2 (default, one flattened Switch 2 package),\n' +
               '  switch1, both (one file each), or all (every dumped package in one file, as the NUP spec lays it out)\n' +
               '--probe lists every installed content meta of the title (incl. add-on data patches) and exits\n' +
@@ -33,6 +36,8 @@ function getArgs(argv) {
   let probe = false;
   let debug = false;
   let noTui = false;
+  let batch = false;
+  let outputDir;
 
   if (argv[0]?.toLowerCase() === 'debug') {
     debug = true;
@@ -76,6 +81,14 @@ function getArgs(argv) {
       continue;
     }
 
+    if (a === '--batch') { batch = true; continue; }
+
+    if (a === '--output-dir') {
+      outputDir = argv[++i];
+      if (!outputDir || outputDir.startsWith('--')) throw new Error('--output-dir needs a folder\n' + USAGE);
+      continue;
+    }
+
     if (a === '--edition') {
       edition = argv[++i];
       if (!['switch1', 'switch2', 'both', 'all'].includes(edition)) {
@@ -95,15 +108,18 @@ function getArgs(argv) {
     throw new Error(USAGE);
   }
 
-  if (ip && !nup) {
-    throw new Error('--ip is used with --nup\n' + USAGE);
+  if (ip && !nup && !batch) {
+    throw new Error('--ip is used with --nup or --batch\n' + USAGE);
   }
 
   const [runArg, titleArg] = args.length === 1 && /^(?:0x)?[0-9a-fA-F]{16}$/.test(args[0])
     ? [undefined, args[0]] : args;
   const title = titleArg ? titleId(titleArg) : undefined;
+  if (batch && (nup || probe || debug || title)) throw new Error('--batch selects games from the library; it cannot be combined with --nup, --probe, debug or a title ID\n' + USAGE);
   if (debug && (nup || probe)) throw new Error('debug cannot be combined with --nup or --probe\n' + USAGE);
-  return { run: runArg ? path.resolve(runArg) : undefined, title, port, nup: nup && path.resolve(nup), ip, edition, probe, debug, noTui };
+  if (outputDir && !batch) throw new Error('--output-dir is used with --batch\n' + USAGE);
+  return { run: runArg ? path.resolve(runArg) : undefined, title, port, nup: nup && path.resolve(nup), ip, edition, probe, debug, noTui,
+    batch, outputDir: outputDir && path.resolve(outputDir) };
 }
 
 const storageNames = { 2: 'Game card', 4: 'Internal', 5: 'SD' };
@@ -193,9 +209,7 @@ function gameMenu(games) {
     .join('\n');
 }
 
-async function pickGame(games, signal) {
-  const input = process.stdin;
-  const output = process.stdout;
+async function pickGame(games, signal, { multiple = false, input = process.stdin, output = process.stdout } = {}) {
 
   if (!games.length) {
     throw new Error('No games were found. How did you even run this?');
@@ -209,7 +223,7 @@ async function pickGame(games, signal) {
   rl.once('SIGINT', close);
   signal.addEventListener('abort', close, { once: true });
 
-  const prompt = () => output.write('Choose a game: ');
+  const prompt = () => output.write(multiple ? 'Choose games (e.g. 1,3,5): ' : 'Choose a game: ');
 
   try {
     if (signal.aborted) return null;
@@ -222,6 +236,11 @@ async function pickGame(games, signal) {
       const value = line.trim();
 
       if (/^q(?:uit)?$/i.test(value)) return null;
+
+      if (multiple) {
+        try { return parseBatchSelection(value, games); }
+        catch (error) { output.write(error.message + '\n'); prompt(); continue; }
+      }
 
       if (/^[0-9]+$/.test(value)) {
         const number = Number(value);
@@ -293,6 +312,7 @@ async function main(argv = process.argv.slice(2)) {
   let attachment;
   let server;
   let completed = false;
+  let batchResult;
   try {
     ui?.start();
     await withCleanup(async () => {
@@ -307,14 +327,28 @@ async function main(argv = process.argv.slice(2)) {
       attachment = await attachGame(run);
       const shouldStop = () => cancellation.signal.aborted;
       let selectedGame;
+      let batchGames;
+      let batchSetup;
       if (!title) {
         ui?.setStage('Reading your game library');
         const games = await discoverGames({ ...attachment, shouldStop });
         if (!games.length) throw new Error('No installed games were found.');
         let selected;
         do {
-          selected = ui ? await ui.chooseGame(games) : await pickGame(games, cancellation.signal);
+          selected = ui ? await ui.chooseGame(games, { multiple: options.batch, selected: batchGames || [] })
+            : await pickGame(games, cancellation.signal, { multiple: options.batch });
           if (!selected || shouldStop()) return;
+          if (Array.isArray(selected)) {
+            batchGames = selected;
+            batchSetup = ui ? await ui.configureBatch({ games: selected, edition,
+              outputDir: options.outputDir || (nup ? path.dirname(nup) : undefined) })
+              : { outputDir: options.outputDir || path.resolve('dumps'), edition };
+            if (shouldStop()) return;
+            if (!batchSetup) continue;
+            break;
+          }
+          batchGames = null;
+          batchSetup = null;
           if (ui) {
             const setup = await ui.configure({ game: selected, output: nup, edition });
             if (shouldStop()) return;
@@ -324,9 +358,11 @@ async function main(argv = process.argv.slice(2)) {
           break;
         } while (true);
         if (!selected || shouldStop()) return;
-        title = selected.title;
-        name = selected.name;
-        selectedGame = selected;
+        if (!batchGames) {
+          title = selected.title;
+          name = selected.name;
+          selectedGame = selected;
+        }
       } else if (ui) {
         // A supplied title still gets names and edition options in the setup screen.
         const games = await discoverGames({ ...attachment, shouldStop });
@@ -335,6 +371,24 @@ async function main(argv = process.argv.slice(2)) {
         const setup = await ui.configure({ game: selectedGame, output: nup, edition });
         if (!setup || shouldStop()) return;
         ({ nup, edition } = setup);
+      }
+      if (batchGames) {
+        // Library enumeration has its own session. Release it before the first
+        // dump, then let each queued game own and clean up its attachment.
+        ui?.setStage('Preparing the batch');
+        const library = attachment;
+        attachment = null;
+        await library.close();
+        try {
+          batchResult = await dumpBatch({ run, games: batchGames, ...batchSetup, image, port, ip, shouldStop,
+            onStage: (stage, details) => ui?.setStage(stage, details),
+            onProgress: ui ? (progress) => ui.progress(progress) : undefined });
+        } catch (error) {
+          if (shouldStop() && error.code === 'FTP_CANCELLED') return;
+          throw error;
+        }
+        completed = true;
+        return;
       }
       if (probe) {
         const content = await listApplicationContent({ ...attachment, title });
@@ -436,11 +490,11 @@ async function main(argv = process.argv.slice(2)) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     }, () => server?.close(), () => attachment?.close());
-    if (completed && ui) await ui.done();
+    if (completed && ui) await ui.done(batchResult ? 'Batch complete (' + batchResult.completed.length + '/' + batchResult.total + ')' : undefined);
   } catch (error) {
     if (ui && !cancellation.signal.aborted) {
       ui.log(error.message);
-      await ui.done('Could not finish the dump');
+      await ui.done(error.batch ? 'Batch stopped (' + error.batch.completed.length + '/' + error.batch.total + ' complete)' : 'Could not finish the dump');
     }
     throw error;
   } finally {
@@ -448,7 +502,9 @@ async function main(argv = process.argv.slice(2)) {
     process.removeListener('SIGINT', stop);
     process.removeListener('SIGTERM', stop);
   }
-  if (completed && ui) console.log('Wrote ' + nup + (edition === 'both' ? ' and its -switch2 companion.' : ''));
+  if (completed && batchResult) console.log('Batch complete: ' + batchResult.completed.length + ' games, ' +
+    batchResult.completed.reduce((count, job) => count + job.outputs.length, 0) + ' NUP files.');
+  else if (completed && ui) console.log('Wrote ' + nup + (edition === 'both' ? ' and its -switch2 companion.' : ''));
   else if (ui && cancellation.signal.aborted) console.log('Stopped. Console cleanup finished.');
 }
 

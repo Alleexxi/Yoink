@@ -1,17 +1,15 @@
 const path = require('node:path');
 const { TextDecoder } = require('node:util');
 const { success, pathRequest, idBytes, resultError, cleanup, withCleanup, closeHandles, throwIfCancelled } = require('./protocol.cjs');
-const { discoverUpdates, discoverDlc, discoverDataPatches, resolveProgramContent, resolveDlcContent, programMatchesApplication, readControl, verifyProgramSnapshot } = require('./content.cjs');
+const { discoverUpdates, discoverDlc, discoverDataPatches, resolveProgramContent, resolveDlcContent, readControl, verifyProgramSnapshot } = require('./content.cjs');
 const { createProgramMounts, prepareInstalledLicense } = require('./program.cjs');
 const { matchingDlc, verifyDlcSnapshot } = require('./dlc.cjs');
 const { prepareBaseProgram, validateProgramEntries } = require('./base-program.cjs');
+const { prepareControl } = require('./prepare-control.cjs');
 
 // ncm mounts + metadata used for getting the ftp server ready
 
 const MAX_CHUNK = 0x40000;
-const safeSize = (n) => { // lol, ai put this in. in what situation would this ever happen
-  return Number(n);
-};
 
 function createGameFiles(attachment) {
   const { openCode, openUpdate, openDataPatch } = createProgramMounts(attachment);
@@ -102,7 +100,7 @@ function createGameFiles(attachment) {
 
       if (mounted.kind === 'storage') {
         const reply = success(await s.ipc('Game storage size', handle, 4), 'Game storage size');
-        mounted.size = safeSize(reply.data.readBigUInt64LE());
+        mounted.size = Number(reply.data.readBigUInt64LE());
       }
 
       if (!update && !dlc) originalSource = source;
@@ -136,7 +134,7 @@ function createGameFiles(attachment) {
           }),
           'Read game directory',
         );
-        const count = safeSize(reply.data.readBigUInt64LE());
+        const count = Number(reply.data.readBigUInt64LE());
 
         if (!count) return entries;
 
@@ -151,7 +149,7 @@ function createGameFiles(attachment) {
           entries.push({
             name,
             type: type === 1 ? 'file' : 'directory',
-            size: safeSize(row.readBigUInt64LE(0x308)),
+            size: Number(row.readBigUInt64LE(0x308)),
           });
         }
       }
@@ -702,57 +700,11 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
     title, mountView, installed, updateGroups, readCodeHeader,
   });
 
-  // the control content (NACP + icon) names the title and lets a loader register it
-  let control = null;
-  const updateControls = {};
-  if (images) {
-    cancelled();
-    try {
-      control = await readControl(a, title, [base.source.storage, 4, 5, 2]);
-      if (control) console.log('Base Control: ' + (control.name || '(no name)') + (control.icon ? ', icon ' + control.icon.length + ' bytes' : ', no icon'));
-      else console.log('Base Control: none found');
-
-      if (!control?.icon) {
-        const patchTitle = (BigInt('0x' + title) + 0x800n).toString(16).padStart(16, '0');
-        const patchGroup = (composedUpdate && composedUpdate.contentTitle === patchTitle
-          ? updateGroups.find((group) => group[0].contentTitle === composedUpdate.contentTitle &&
-            group[0].version === composedUpdate.version)
-          : updateGroups.filter((group) => group[0].contentTitle === patchTitle)
-            .sort((left, right) => right[0].version - left[0].version)[0]);
-        if (patchGroup) {
-          const update = patchGroup[0];
-          const updateControl = await readControl(a, title, patchGroup.map((item) => item.storage), {
-            update: { contentTitle: update.contentTitle, version: update.version },
-          });
-          updateControls[update.contentTitle + ':' + update.version] = updateControl;
-          // the update's whole control (NACP, name, version, publisher) goes with its icon
-          if (updateControl && (!control || updateControl.icon)) control = updateControl;
-          if (updateControl?.icon && control?.iconSource?.selection === 'update') {
-            console.log('Control icon fallback: update v' + update.version + ', ' + control.icon.length + ' bytes');
-          }
-        }
-      }
-      if (control) console.log('Control: ' + (control.name || '(no name)') + (control.icon ? ', icon ' + control.icon.length + ' bytes' : ', no icon'));
-      else console.log('Control: none found (the nup will have no name or icon)');
-    } catch (error) {
-      if (!error.nativeResult) throw error;
-      console.log('Could not read control content: ' + error.message);
-    }
-    for (const group of updateGroups) {
-      const update = group[0];
-      const key = update.contentTitle + ':' + update.version;
-      if (Object.hasOwn(updateControls, key)) continue;
-      cancelled();
-      try {
-        updateControls[key] = await readControl(a, title, group.map((item) => item.storage), {
-          update: { contentTitle: update.contentTitle, version: update.version },
-        });
-      } catch (error) {
-        if (!error.nativeResult) throw error;
-        console.log('Could not read update control v' + update.version + ': ' + error.message);
-      }
-    }
-  }
+  const metadata = images
+    ? await prepareControl({ attachment: a, title, base, updateGroups, composedUpdate, shouldStop })
+    : { control: null, updateControls: {} };
+  let { control } = metadata;
+  const { updateControls } = metadata;
 
   for (const group of updateGroups) {
     if (composedUpdate && group[0].contentTitle === composedUpdate.contentTitle && group[0].version === composedUpdate.version) continue;
@@ -775,8 +727,10 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
   let editionControlVersion = -1;
   // Program[1] is the Switch 2 counterpart only for Switch 1 titles. Native
   // Switch 2 titles can also contain a second program, with separate rights.
-  for (const group of (!title.startsWith('01') || process.env.YOINK_NO_SWITCH2 || process.env.OZ_NO_SWITCH2 ||
-    (images && edition === 'switch1')) ? [] : updateGroups) {
+  const includeEdition = title.startsWith('01') &&
+    !process.env.YOINK_NO_SWITCH2 && !process.env.OZ_NO_SWITCH2 &&
+    !(images && edition === 'switch1');
+  for (const group of includeEdition ? updateGroups : []) {
     const prefix = '/switch2/updates/' + group[0].version;
     const candidates = group.map((item) => ({
       storage: item.storage,

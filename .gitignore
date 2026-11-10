@@ -10,3 +10,4 @@ connection.json
 *.bytecheck.txt
 .ouncecake-*/
 .yoink-*/
+/ai-audits/

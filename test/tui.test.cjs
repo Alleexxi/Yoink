@@ -138,3 +138,58 @@ test('first-run screen accepts a pasted path and can be cancelled', async (t) =>
   key('escape');
   assert.equal(await retry, null);
 });
+
+test('Space selects several games across filters and Enter returns the marked queue', async (t) => {
+  const { ui, key, screen } = terminal(t);
+  const choice = ui.chooseGame(games);
+  key('space', ' ');
+  key('slash', '/');
+  key('text', 'Poké');
+  key('return');
+  key('space', ' ');
+  assert.match(stripVTControlCharacters(screen()), /2 selected/);
+  key('slash', '/');
+  key('escape');
+  assert.equal(ui.marked.size, 2);
+  key('return');
+  assert.deepEqual(await choice, [games[0], games[2]]);
+});
+
+test('explicit batch selection requires marks and supports deselecting and restoring them', async (t) => {
+  const { ui, key } = terminal(t);
+  const choice = ui.chooseGame(games, { multiple: true, selected: [games[0]] });
+  key('space', ' ');
+  key('return');
+  assert.match(ui.error, /at least one/);
+  key('down');
+  key('space', ' ');
+  key('return');
+  assert.deepEqual(await choice, [games[1]]);
+});
+
+test('batch setup edits a folder, applies an edition and keeps the action on NUP', async (t) => {
+  const { ui, key, screen } = terminal(t);
+  const setup = ui.configureBatch({ games: [games[0], games[2]], outputDir: path.resolve('dumps'), edition: 'switch2' });
+  assert.match(stripVTControlCharacters(screen()), /BATCH DUMP SETUP/);
+  key('right');
+  assert.equal(ui.action, 'nup');
+  key('down');
+  key('return');
+  key('u', undefined, { ctrl: true });
+  key('text', path.resolve('new batch folder'));
+  key('return');
+  key('down');
+  key('right');
+  key('down');
+  key('return');
+  assert.deepEqual(await setup, { outputDir: path.resolve('new batch folder'), edition: 'switch1' });
+});
+
+test('batch setup can go back and progress shows queue position', async (t) => {
+  const { ui, key, screen } = terminal(t);
+  const setup = ui.configureBatch({ games, edition: 'both' });
+  key('escape');
+  assert.equal(await setup, null);
+  ui.setStage('Opening game content', { game: games[1], batch: { index: 2, total: 3, completed: 1 }, transfer: null });
+  assert.match(stripVTControlCharacters(screen()), /Batch 2\/3.*1 completed/);
+});

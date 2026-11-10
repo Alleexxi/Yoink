@@ -8,6 +8,9 @@
 #define PATH_BYTES 1024
 #define NONBLOCK 0x800
 #define DONTWAIT 0x80
+// nn::socket uses the BSD option values, not Linux's SOL_SOCKET/SO_REUSEADDR.
+#define SOCKET_LEVEL 0xffff
+#define REUSE_ADDRESS 4
 
 void *memset(void *p, int value, __SIZE_TYPE__ n) {u8 *b=p; for (__SIZE_TYPE__ i=0;i<n;i++) b[i]=(u8)value; return p;}
 void *memcpy(void *p, const void *q, __SIZE_TYPE__ n) {u8 *a=p;const u8 *b=q;for (__SIZE_TYPE__ i=0;i<n;i++) a[i]=b[i];return p;}
@@ -404,19 +407,29 @@ static void collect_clients(FtpConfig *c,int stop) {
     }
     c->sent=sent;c->files=files;
 }
+static void *startup_failure(FtpConfig *c,int fd,int socket_error) {
+    // Close can change errno. Preserve the error from the failed startup call.
+    c->native_result=socket_error?(u32)c->functions->get_errno():0;
+    if(fd>=0)c->functions->close(fd);
+    c->state=3;return (void *)(u64)BAD;
+}
 void *ftp_main(void *configuration) {
     FtpConfig *c=configuration;
     if(!c||c->magic!=CFG_MAGIC||c->version!=1)return (void *)(u64)BAD;
-    Server s;memset(&s,0,sizeof(s));s.c=c;s.cache_source=NONE;c->state=0;c->result=BAD;
+    Server s;memset(&s,0,sizeof(s));s.c=c;s.cache_source=NONE;c->state=0;c->result=BAD;c->phase=FTP_CONFIG;
     if(!c->functions||!c->ipc_buffer||!c->data||c->data_bytes<4096||c->data_bytes>0x400000||
         !c->port||c->port>65535||!c->slots||!c->reserved||c->reserved>FTP_MAX_CLIENTS||
-        c->slot_bytes<4096+c->data_bytes+8192||!index_valid(&s)) {c->state=3;return (void *)(u64)BAD;}
+        c->slot_bytes<4096+c->data_bytes+8192||!index_valid(&s))return startup_failure(c,-1,0);
     for(u32 i=0;i<c->reserved;i++)memset(c->slots+i*c->slot_bytes,0,sizeof(ClientSlot));
-    FtpFunctions *f=c->functions;int fd=f->socket(2,1,0);
-    if(fd<0) {c->state=3;return (void *)(u64)BAD;}
+    FtpFunctions *f=c->functions;c->phase=FTP_SOCKET;int fd=f->socket(2,1,0);
+    if(fd<0)return startup_failure(c,-1,1);
+    // A closed control connection can leave the previous listener's port in
+    // TIME_WAIT. Reuse it for the next game while still rejecting active listeners.
+    if(f->setsockopt) {int one=1;f->setsockopt(fd,SOCKET_LEVEL,REUSE_ADDRESS,&one,4);}
     Address address={16,2,swap16((u16)c->port),0,{0}};
-    if(f->bind(fd,&address,16)||f->listen(fd,(int)c->reserved)) {f->close(fd);c->state=3;return (void *)(u64)BAD;}
-    c->result=0;c->state=1;
+    c->phase=FTP_BIND;if(f->bind(fd,&address,16))return startup_failure(c,fd,1);
+    c->phase=FTP_LISTEN;if(f->listen(fd,(int)c->reserved))return startup_failure(c,fd,1);
+    c->phase=FTP_RUNNING;c->result=0;c->state=1;
     while(!c->stop) {
         collect_clients(c,0);
         int ready=wait_fd(c,fd,1,1);if(ready<0) {c->result=BAD;break;}if(!ready)continue;
@@ -435,12 +448,12 @@ void *ftp_main(void *configuration) {
         slot->server=s;slot->server.c=&slot->config;slot->server.cache_source=NONE;slot->control=client;slot->peer=peer;slot->running=1;
         if(f->thread_create(&slot->thread,0,client_worker,slot)) {slot->running=0;slot->thread=0;f->close(client);}
     }
-    f->close(fd);
+    c->phase=FTP_STOPPING;f->close(fd);
     for(;;) {
         collect_clients(c,1);int active=0;
         for(u32 i=0;i<c->reserved;i++)if(((ClientSlot *)(c->slots+i*c->slot_bytes))->thread)active=1;
         if(!active)break;
         PollFd delay={-1,0,0};f->poll(&delay,1,50);
     }
-    c->state=c->result?3:2;return (void *)(u64)c->result;
+    c->phase=FTP_STOPPED;c->state=c->result?3:2;return (void *)(u64)c->result;
 }

@@ -6,6 +6,7 @@ const { pipeline } = require('node:stream/promises');
 const { promisify } = require('node:util');
 const { createHash } = require('node:crypto');
 const { FtpClient } = require('./ftp-client.cjs');
+const { editionOutputs } = require('./outputs.cjs');
 
 // writes a .nup (see the NUP spec) straight from our own ftp server
 // romfs comes down as one big image per mount (<prefix>/romfs.img) and gets cut up here,
@@ -830,18 +831,6 @@ async function pullImage(client, ftpPath, size, consumers, shouldStop, onProgres
   meter.end();
 
   for (const consumer of consumers) consumer.finish(ftpPath);
-}
-
-// 'both' writes two files from one run (Switch 1 as the given name, Switch 2 with a -switch2 suffix);
-// any other edition is a single file
-function editionOutputs(output, edition) {
-  if (edition !== 'both') return [{ output, edition }];
-  const ext = path.extname(output);
-  const stem = path.join(path.dirname(output), path.basename(output, ext));
-  return [
-    { output, edition: 'switch1' },
-    { output: stem + '-switch2' + ext, edition: 'switch2' },
-  ];
 }
 
 async function packNup({ host, port, views, title, name, output, edition = 'switch2', control = null, updateControls = {}, shouldStop = () => false, onProgress }) {
