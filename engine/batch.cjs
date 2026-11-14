@@ -56,7 +56,7 @@ async function planBatch({ games, outputDir, edition = 'switch2' }) {
 // A separate attachment per game releases mounts and native FTP workers before
 // the next game starts. Any dump or cleanup failure stops the queue.
 async function dumpBatch({ run, games, outputDir, image, port = 2121, ip, edition = 'switch2',
-  shouldStop = () => false, onStage = () => {}, onProgress },
+  mergeEditionDlc, shouldStop = () => false, onStage = () => {}, onProgress },
   services = { attachGame, prepareGame, deployFtp, packNup, getConsoleIp }) {
   throwIfCancelled(shouldStop);
   const jobs = await planBatch({ games, outputDir, edition });
@@ -83,7 +83,8 @@ async function dumpBatch({ run, games, outputDir, image, port = 2121, ip, editio
         throwIfCancelled(shouldStop);
         onStage('Downloading and packing', { ...details, host });
         await services.packNup({ host, port, views: prepared.views, title: job.title, name: job.game.name,
-          output: job.output, edition, control: prepared.control, updateControls: prepared.updateControls, shouldStop, onProgress });
+          output: job.output, edition, control: prepared.control, updateControls: prepared.updateControls,
+          flattenUnrealChunks: mergeEditionDlc, shouldStop, onProgress });
         completed.push(job);
       }, async () => {
         onStage('Cleaning up the console', { batch: { ...details.batch, completed: completed.length } });

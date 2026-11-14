@@ -74,10 +74,13 @@ test('batch selection validates numbers and removes repeated selections', () => 
 });
 
 test('CLI accepts batch options and rejects conflicting single-game modes', () => {
-  const options = getArgs(['--batch', '--output-dir', 'dumps', '--edition', 'both', '--ip', '192.168.2.162', '--no-tui']);
+  const options = getArgs(['--batch', '--output-dir', 'dumps', '--edition', 'both', '--ip', '192.168.2.162', '--no-tui', '--merge-edition-dlc']);
   assert.equal(options.batch, true);
   assert.equal(options.outputDir, path.resolve('dumps'));
   assert.equal(options.edition, 'both');
+  assert.equal(options.mergeEditionDlc, true);
+  assert.equal(getArgs(['--nup', 'pikmin.nup', '--no-merge-edition-dlc']).mergeEditionDlc, false);
+  assert.equal(getArgs(['--nup', 'pikmin.nup']).mergeEditionDlc, undefined);
   for (const args of [['--batch', '--nup', 'game.nup'], ['--batch', '--probe'], ['--batch', games[0].title],
     ['--output-dir', 'dumps'], ['--batch', '--output-dir']]) assert.throws(() => getArgs(args), /batch|output-dir/);
 });
@@ -99,6 +102,7 @@ test('batch runs sequentially and closes FTP then its attachment before the next
   const stages = [];
   const progress = [];
   const result = await dumpBatch({ run: '/run', games: games.slice(0, 2), outputDir, image: Buffer.alloc(1), edition: 'both',
+    mergeEditionDlc: true,
     onStage: (stage, details) => stages.push({ stage, details }), onProgress: (value) => progress.push(value) }, f.services);
   assert.deepEqual(f.events, [
     'attach:0', 'ip:0', 'prepare:0', 'ftp:0', 'pack:0', 'ftp.close:0', 'attachment.close:0',
@@ -108,6 +112,7 @@ test('batch runs sequentially and closes FTP then its attachment before the next
   assert.equal((await fs.readdir(outputDir)).length, 4);
   assert.deepEqual(f.packs.map((options) => options.title), games.slice(0, 2).map((game) => game.title));
   assert.ok(f.packs.every((options) => options.edition === 'both'));
+  assert.ok(f.packs.every((options) => options.flattenUnrealChunks === true));
   for (const options of f.packs) {
     assert.equal(options.updateControls[options.title + ':131072'].version, '1.1.0');
   }

@@ -2,7 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const content = require('./content.cjs');
 const mounts = require('./mounts.cjs');
-const { planPackages } = require('./nup.cjs');
+const { planPackages, shouldMergeEditionDlc } = require('./nup.cjs');
 const { success, pathRequest, throwIfCancelled } = require('./protocol.cjs');
 const { storageNames, contentTypes, sha256, sourceDetails, errorDetails, controlSummary } = require('./diagnostics.cjs');
 
@@ -16,9 +16,6 @@ async function buildInfo() {
     for (const option of ['NO_SWITCH2', 'ALL_UPDATE_VERSIONS', 'SKIP_UPDATES', 'NO_DATA_PATCHES']) {
       if (process.env[prefix + option] !== undefined) overrides[prefix + option] = process.env[prefix + option];
     }
-  }
-  if (process.env.YOINK_FLATTEN_UNREAL_CHUNKS !== undefined) {
-    overrides.YOINK_FLATTEN_UNREAL_CHUNKS = process.env.YOINK_FLATTEN_UNREAL_CHUNKS;
   }
   return { node: process.version, platform: process.platform, arch: process.arch, sourceHashes, overrides };
 }
@@ -39,10 +36,12 @@ function layerDetails(view) {
 
 // Collect independent metadata probes before game mounts, so an ExeFS/RomFS
 // failure cannot hide the reason an edition's name or icon was unavailable.
-async function collectDebugReport({ attachment: a, title, shouldStop = () => false, onStage = () => {} },
+async function collectDebugReport({ attachment: a, title, mergeEditionDlc, shouldStop = () => false, onStage = () => {} },
   services = { ...content, prepareGame: mounts.prepareGame, buildInfo }) {
+  const mergeOptionSource = mergeEditionDlc === undefined ? 'game default' : 'explicit option';
+  mergeEditionDlc = shouldMergeEditionDlc(title, mergeEditionDlc);
   const report = { schemaVersion: 2, generatedAt: new Date().toISOString(), title: title.toUpperCase(), build: await services.buildInfo(),
-    installedContent: [], programs: [], controlProbes: [], updateControls: [], layers: [] };
+    packingOptions: { mergeEditionDlc, mergeOptionSource }, installedContent: [], programs: [], controlProbes: [], updateControls: [], layers: [] };
   const partialViews = [];
   let stage;
   const enter = (value) => { throwIfCancelled(shouldStop); stage = value; onStage(value); };
@@ -131,7 +130,7 @@ async function collectDebugReport({ attachment: a, title, shouldStop = () => fal
         size: item.size, source: sourceDetails(item.source),
       }));
       try {
-        report.switch2PackagePlan = planPackages(views, title, 'switch2').map((pack) => ({
+        report.switch2PackagePlan = planPackages(views, title, 'switch2', { flattenUnrealChunks: mergeEditionDlc }).map((pack) => ({
           kind: ['base', 'update', 'addon', 'addon_update'][pack.kind] || pack.kind,
           plannedTitleId: pack.titleId, version: pack.version,
           exefsFiles: pack.exefsFiles.length,

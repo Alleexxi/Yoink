@@ -25,6 +25,10 @@ const patchedAddonId = (source) => {
 const STANDALONE_UPDATE = 1;
 const CODEC = { raw: 0, zstd: 1 };
 const MEMORY_LIMIT = 64 * 1024 * 1024; // files bigger than this get spilled to disk while they come in
+function shouldMergeEditionDlc(title, override) {
+  if (override !== undefined) return override;
+  return ['0100b7c00933a000', '0400b7c00933a000'].includes(title.toLowerCase());
+}
 const ZSTD = { params: { [zlib.constants.ZSTD_c_compressionLevel]: 3 } };
 const zstdCompress = promisify(zlib.zstdCompress);
 
@@ -323,7 +327,8 @@ function addLayeredRomfs(romfsDir, layerSpecs) {
 // 'switch1' packs the Switch 1 program, 'both' writes one file for each edition, and 'all' keeps every
 // dumped package (base, updates incl. the Switch 2 program, add-ons, add-on data patches) in one file
 function planPackages(views, title, edition = 'switch2',
-  { flattenUnrealChunks = process.env.YOINK_FLATTEN_UNREAL_CHUNKS === '1' } = {}) {
+  { flattenUnrealChunks } = {}) {
+  flattenUnrealChunks = shouldMergeEditionDlc(title, flattenUnrealChunks);
   const groups = new Map();
 
   for (const view of views) {
@@ -872,7 +877,11 @@ async function pullImage(client, ftpPath, size, consumers, shouldStop, onProgres
 }
 
 async function packNup({ host, port, views, title, name, output, edition = 'switch2', control = null, updateControls = {},
-  flattenUnrealChunks = process.env.YOINK_FLATTEN_UNREAL_CHUNKS === '1', shouldStop = () => false, onProgress }) {
+  flattenUnrealChunks, shouldStop = () => false, onProgress }) {
+  flattenUnrealChunks = shouldMergeEditionDlc(title, flattenUnrealChunks);
+  if (flattenUnrealChunks && ['switch2', 'both'].includes(edition)) {
+    console.log('Edition DLC merge enabled: matching companion chunks go into the base; addon packages are retained.');
+  }
   const targets = editionOutputs(output, edition).map((target) => {
     const packages = planPackages(views, title, target.edition, { flattenUnrealChunks });
     const plan = layout(packages);
@@ -1026,4 +1035,4 @@ async function packNup({ host, port, views, title, name, output, edition = 'swit
   }
 }
 
-module.exports = { packNup, planPackages, layout, encodeToc, encodeSuperblock };
+module.exports = { packNup, planPackages, layout, encodeToc, encodeSuperblock, shouldMergeEditionDlc };

@@ -482,6 +482,28 @@ test('experimental flattening copies all companion chunk files into the base and
   assert.equal(extents[0], extents[1]);
 });
 
+test('Pikmin 4 merges companion chunks by default and supports an explicit opt-out', async (t) => {
+  const pikminTitle = '0100b7c00933a000';
+  for (const flattenUnrealChunks of [undefined, false]) {
+    const { data, addonFiles } = unrealCardFixture();
+    for (const view of data.views.filter(view => view.path.startsWith('/switch2/'))) {
+      view.source.runtimeProgramId = '0400b7c00933a000';
+      view.source.contentTitle = '0100b7c00933a800';
+    }
+    data.files.get('/switch2/updates/720896/exefs/main.npdm').writeBigUInt64LE(0x0400b7c00933a000n, 0x10);
+    const server = await ftpServer(t, data.files);
+    const output = path.join(await directory(t), 'pikmin.nup');
+    await packNup({ ...server, ...data, title: pikminTitle, output, edition: 'switch2', flattenUnrealChunks });
+    const packages = readArchive(await fs.readFile(output));
+    const program = packages.find(pack => pack.kind === 0);
+    assert.equal(program.id, '0400b7c00933a000');
+    for (const filename of Object.keys(addonFiles)) {
+      assert.equal(program.romfs.has(filename), flattenUnrealChunks !== false);
+      assert.ok(packages.find(pack => pack.kind === 2).romfs.has(filename));
+    }
+  }
+});
+
 test('both mode merges companion files only into the Switch 2 base and downloads DLC once', async (t) => {
   const { data, addonFiles } = unrealCardFixture();
   const server = await ftpServer(t, data.files);
@@ -531,7 +553,7 @@ test('companion flattening rejects mismatched projects, platforms, markers and i
   }
 });
 
-test('the documented environment switch enables companion flattening without extra CLI options', (t) => {
+test('merging requires the visible CLI option and ignores the former environment switch', (t) => {
   const previous = process.env.YOINK_FLATTEN_UNREAL_CHUNKS;
   process.env.YOINK_FLATTEN_UNREAL_CHUNKS = '1';
   t.after(() => {
@@ -539,7 +561,10 @@ test('the documented environment switch enables companion flattening without ext
     else process.env.YOINK_FLATTEN_UNREAL_CHUNKS = previous;
   });
   const { data } = unrealCardFixture();
-  const packs = planPackages(data.views, baseId, 'switch2');
+  assert.equal(planPackages(data.views, baseId, 'switch2')[0].romfsLayers.length, 1);
+  const { getArgs } = require('../yoink.cjs');
+  const options = getArgs(['--nup', 'merged.nup', '--merge-edition-dlc']);
+  const packs = planPackages(data.views, baseId, options.edition, { flattenUnrealChunks: options.mergeEditionDlc });
   assert.equal(packs[0].romfsLayers.length, 2);
   assert.equal(packs.find((pack) => pack.kind === 2).romfsLayers.length, 1);
 });

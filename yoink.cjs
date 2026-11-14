@@ -26,6 +26,8 @@ const USAGE = 'Usage: node yoink.cjs [run-directory|runs-directory] [title-id] [
               'In the TUI, Space marks games for a batch and Enter opens batch setup\n' +
               '--edition picks how a Switch 2 Edition is packed: switch2 (default, one flattened Switch 2 package),\n' +
               '  switch1, both (one file each), or all (every dumped package in one file, as the NUP spec lays it out)\n' +
+              'Pikmin 4 merges matching companion chunks into its Switch 2 base by default, retaining addon packages\n' +
+              '--merge-edition-dlc enables this for other games; --no-merge-edition-dlc disables it for comparison\n' +
               '--probe lists every installed content meta of the title (incl. add-on data patches) and exits\n' +
               'debug prints build hashes, program identities, Control errors/directories and base/update/DLC layers without starting FTP\n';
 
@@ -37,6 +39,7 @@ function getArgs(argv) {
   let edition = 'switch2';
   let probe = false;
   let debug = false;
+  let mergeEditionDlc;
   let noTui = false;
   let batch = false;
   let outputDir;
@@ -77,6 +80,8 @@ function getArgs(argv) {
       probe = true;
       continue;
     }
+    if (a === '--merge-edition-dlc') { mergeEditionDlc = true; continue; }
+    if (a === '--no-merge-edition-dlc') { mergeEditionDlc = false; continue; }
 
     if (a === '--no-tui') {
       noTui = true;
@@ -119,8 +124,9 @@ function getArgs(argv) {
   const title = titleArg ? titleId(titleArg) : undefined;
   if (batch && (nup || probe || debug || title)) throw new Error('--batch selects games from the library; it cannot be combined with --nup, --probe, debug or a title ID\n' + USAGE);
   if (debug && (nup || probe)) throw new Error('debug cannot be combined with --nup or --probe\n' + USAGE);
+  if (mergeEditionDlc !== undefined && probe) throw new Error('Edition DLC merge options are used with NUP packing or debug, not --probe\n' + USAGE);
   if (outputDir && !batch) throw new Error('--output-dir is used with --batch\n' + USAGE);
-  return { run: runArg ? path.resolve(runArg) : undefined, title, port, nup: nup && path.resolve(nup), ip, edition, probe, debug, noTui,
+  return { run: runArg ? path.resolve(runArg) : undefined, title, port, nup: nup && path.resolve(nup), ip, edition, probe, debug, noTui, mergeEditionDlc,
     batch, outputDir: outputDir && path.resolve(outputDir) };
 }
 
@@ -309,6 +315,7 @@ async function main(argv = process.argv.slice(2)) {
         await library.close();
         try {
           batchResult = await dumpBatch({ run, games: batchGames, ...batchSetup, image, port, ip, shouldStop,
+            mergeEditionDlc: options.mergeEditionDlc,
             onStage: (stage, details) => ui?.setStage(stage, details),
             onProgress: ui ? (progress) => ui.progress(progress) : undefined });
         } catch (error) {
@@ -342,6 +349,7 @@ async function main(argv = process.argv.slice(2)) {
       }
       if (options.debug) {
         const report = await collectDebugReport({ attachment, title, shouldStop,
+          mergeEditionDlc: options.mergeEditionDlc,
           onStage: (stage) => console.log('Debug: ' + stage) });
         console.log(JSON.stringify(report, null, 2));
         return;
@@ -367,6 +375,7 @@ async function main(argv = process.argv.slice(2)) {
         ui?.setStage('Downloading and packing');
         console.log('FTP up at ' + host + ':' + port + ', downloading into ' + nup);
         await packNup({ host, port, views: prepared.views, title, name, output: nup, edition, control: prepared.control, updateControls: prepared.updateControls, shouldStop,
+          flattenUnrealChunks: options.mergeEditionDlc,
           onProgress: ui ? (progress) => ui.progress(progress) : undefined });
         completed = true;
         ui?.setStage('Cleaning up the console');

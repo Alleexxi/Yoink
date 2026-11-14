@@ -69,11 +69,10 @@ node yoink.cjs --nup game.nup --edition switch2
 
 For a game that isn't a Switch 2 Edition, `--edition` makes no difference: there's only one program to pack.
 
-To test merging Pikmin 4's companion Unreal chunk into its Switch 2 base, enable
-the experimental option in PowerShell before dumping:
+Pikmin 4 merges its matching companion Unreal chunk into the Switch 2 base by
+default. No environment variable or extra flag is needed:
 
 ```powershell
-$env:YOINK_FLATTEN_UNREAL_CHUNKS = '1'
 node yoink.cjs <path-to-ns2jb-run> 0100B7C00933A000 --nup pikmin4-switch2-merged.nup --edition switch2 --no-tui
 ```
 
@@ -83,8 +82,12 @@ for games that query add-on availability. The DLC image is downloaded once and
 identical payloads share stored data within the NUP. A matching project/platform,
 chunk marker and complete `.pak`/`.ucas`/`.utoc` set are required; unrelated DLC
 is left separate. This applies to the Switch 2 output of `switch2` and `both`;
-`switch1` and `all` retain their normal package layouts. Debug's package plan
-honors the same option. Set it to `'0'` to return to normal packing. Whether this
+`switch1` and `all` retain their normal package layouts. Other games keep their
+existing defaults; `--merge-edition-dlc` enables this matching rule explicitly,
+and `--no-merge-edition-dlc` disables it for comparison. Debug's package plan
+uses the same defaults and flags and records the selection under `packingOptions`.
+The previous `YOINK_FLATTEN_UNREAL_CHUNKS` environment variable is no longer used.
+Whether this
 restores the in-game edition banner/options still needs an emulator test.
 
 Switch 2 output uses the edition's own name, icon, localized NACP and display version from

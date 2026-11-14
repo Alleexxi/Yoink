@@ -60,7 +60,7 @@ function fixture({ prepareFailure, controlFailure, cancelAfterIdentity = false }
       return { views, sources: [], control };
     },
   };
-  return { calls, run: () => collectDebugReport({ attachment, title, shouldStop: () => cancelled }, services) };
+  return { calls, run: (options = {}) => collectDebugReport({ attachment, title, shouldStop: () => cancelled, ...options }, services) };
 }
 
 test('debug report identifies program 0 editions and probes shared and separate Control content', async () => {
@@ -138,20 +138,25 @@ test('build fingerprints identify the exact packaged runtime files', async () =>
   assert.equal(Object.keys(info.sourceHashes).length, 7);
 });
 
-test('debug build information records the experimental merge switch', async (t) => {
+test('debug reports the explicit merge option rather than inheriting the former environment switch', async (t) => {
   const previous = process.env.YOINK_FLATTEN_UNREAL_CHUNKS;
   process.env.YOINK_FLATTEN_UNREAL_CHUNKS = '1';
   t.after(() => {
     if (previous === undefined) delete process.env.YOINK_FLATTEN_UNREAL_CHUNKS;
     else process.env.YOINK_FLATTEN_UNREAL_CHUNKS = previous;
   });
-  assert.equal((await buildInfo()).overrides.YOINK_FLATTEN_UNREAL_CHUNKS, '1');
+  assert.equal((await buildInfo()).overrides.YOINK_FLATTEN_UNREAL_CHUNKS, undefined);
+  assert.equal((await fixture().run()).packingOptions.mergeEditionDlc, true);
+  assert.equal((await fixture().run()).packingOptions.mergeOptionSource, 'game default');
+  assert.equal((await fixture().run({ mergeEditionDlc: false })).packingOptions.mergeEditionDlc, false);
+  assert.equal((await fixture().run({ mergeEditionDlc: true })).packingOptions.mergeEditionDlc, true);
 });
 
 test('debug remains a separate CLI mode that rejects packing options', () => {
-  const options = getArgs(['debug', title]);
+  const options = getArgs(['debug', title, '--merge-edition-dlc']);
   assert.equal(options.debug, true);
   assert.equal(options.title, title);
+  assert.equal(options.mergeEditionDlc, true);
   for (const args of [['debug', '--nup', 'test.nup'], ['debug', '--probe'], ['debug', '--batch']]) {
     assert.throws(() => getArgs(args), /cannot be combined/);
   }
