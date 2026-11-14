@@ -20,8 +20,9 @@ const originalSource = { storage: 2, attributes: 1, contentPath: '@GcContent://b
 
 // Exercise the real selection and mapping code using an in-memory console and
 // the same run-directory module boundary used by ns2jb. No live console calls.
-async function consoleFixture(t, { rows = baseline, previous = null, failure, programIndex = 1 } = {}) {
-  const selected = { ...source, programIndex, runtimeProgramId: programIndex ? runtimeProgramId : title };
+async function consoleFixture(t, { rows = baseline, previous = null, failure, programIndex = 1,
+  selectedProgramId = programIndex ? runtimeProgramId : title } = {}) {
+  const selected = { ...source, programIndex, runtimeProgramId: selectedProgramId };
   const run = await fs.mkdtemp(path.join(os.tmpdir(), 'yoink-program-'));
   const engine = path.join(run, 'switch2');
   await fs.mkdir(path.join(engine, 'ro'), { recursive: true });
@@ -54,6 +55,7 @@ async function consoleFixture(t, { rows = baseline, previous = null, failure, pr
         return { result: 0 };
       }
       if (label === 'Open selected game CodeFS') {
+        state.openedRows = structuredClone(state.rows);
         // Model the reported game-card + installed-update failure. The NCA's
         // location and the loader's original-program storage are separate inputs.
         if (input[1] !== originalSource.storage) return { result: 0x97000408, data: Buffer.alloc(0) };
@@ -156,6 +158,24 @@ test('Program[0] retains base-storage composition and restores the previous regi
   assert.deepEqual(f.state.location, previous);
   assert.ok(!f.state.calls.some((call) => call.command === 810));
   for (const handle of [40, 52, 55]) assert.ok(!f.s.handles.has(handle));
+});
+
+test('a program 0 edition maps its 0400 runtime ID to index 0 and restores console state', async (t) => {
+  const selectedProgramId = '0400e95004038000';
+  const previous = { contentPath: '@GcContent://previous-program-0.nca', attributes: '01' + '00'.repeat(15) };
+  for (const failure of [undefined, new Error('Console response timed out')]) {
+    const f = await consoleFixture(t, { programIndex: 0, selectedProgramId, previous, failure });
+    if (failure) await assert.rejects(f.open(), (error) => error === failure);
+    else assert.equal(await f.open(), 21);
+    const code = f.state.calls.find((call) => call.label === 'Open selected game CodeFS');
+    assert.equal(code.input[1], originalSource.storage);
+    assert.equal(code.input.readBigUInt64LE(8), BigInt('0x' + selectedProgramId));
+    assert.deepEqual(f.state.openedRows, [...baseline,
+      { programId: selectedProgramId, applicationId: title, programIndex: 0, flags: 0 }]);
+    assert.deepEqual(f.state.rows, baseline);
+    assert.deepEqual(f.state.location, previous);
+    for (const handle of [40, 52, 55]) assert.ok(!f.s.handles.has(handle));
+  }
 });
 
 test('a matching existing mapping is reused without resetting the global map', async (t) => {

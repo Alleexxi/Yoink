@@ -236,6 +236,27 @@ function isEnhancementDlcRomfs(romfsView, baseFilePaths) {
   return false;
 }
 
+// Pikmin 4's edition carries chunk 0 in its primary RomFS and chunk 1 in
+// AddOnContent. Match the complete marker + pak/ucas/utoc layout and the same
+// project/platform before allowing the experimental copy into the base.
+function isCompanionUnrealChunk(romfsView, primaryPaths) {
+  if (!romfsView || romfsView.source.metaType !== 0x82 || !primaryPaths.has('/__chunks')) return false;
+  const files = romfsView.entries.filter((entry) => entry.type !== 'directory');
+  if (files.length !== 4) return false;
+  const marker = files.find((entry) => /^\/__chunks_[1-9]\d*$/.test(entry.path));
+  if (!marker) return false;
+  const chunk = marker.path.slice('/__chunks_'.length);
+  const paths = new Set(files.map((entry) => entry.path));
+  for (const primary of primaryPaths) {
+    const match = /^(\/.*\/Content\/Paks\/)pakchunk0-([^/]+)\.pak$/.exec(primary);
+    if (!match) continue;
+    if (['pak', 'ucas', 'utoc'].every((extension) =>
+      primaryPaths.has(match[1] + 'pakchunk0-' + match[2] + '.' + extension) &&
+      paths.has(match[1] + 'pakchunk' + chunk + '-' + match[2] + '.' + extension))) return true;
+  }
+  return false;
+}
+
 // overlays multiple RomFS views in low-to-high precedence order into one romfs tree,
 // pruning shadowed lower-layer file entries so superseded bytes are never pulled or stored
 function addLayeredRomfs(romfsDir, layerSpecs) {
@@ -298,10 +319,11 @@ function addLayeredRomfs(romfsDir, layerSpecs) {
 }
 
 // edition: 'switch2' (default) packs a self-contained Switch 2 Edition base package (flattening
-// updated program[0] RomFS + Switch 2 Upgrade Pack DLC RomFS + program[1] RomFS + program[1] ExeFS),
+// the primary program RomFS + Switch 2 Upgrade Pack DLC + any program[1] RomFS, with Switch 2 ExeFS),
 // 'switch1' packs the Switch 1 program, 'both' writes one file for each edition, and 'all' keeps every
 // dumped package (base, updates incl. the Switch 2 program, add-ons, add-on data patches) in one file
-function planPackages(views, title, edition = 'switch2') {
+function planPackages(views, title, edition = 'switch2',
+  { flattenUnrealChunks = process.env.YOINK_FLATTEN_UNREAL_CHUNKS === '1' } = {}) {
   const groups = new Map();
 
   for (const view of views) {
@@ -330,13 +352,20 @@ function planPackages(views, title, edition = 'switch2') {
     const s2Group = switch2Updates[0];
     const s2Source = (s2Group.exefs || s2Group.romfs).source;
     const s2Version = s2Source.version >>> 0;
+    // A Switch 2 Edition card can expose the Switch 2 program as program 0 of the
+    // update; that group's own RomFS is then the primary, not a program-1 layer.
+    const s2ProgramIsUpdate = s2Source.metaType === 0x81 && !s2Source.programIndex;
+    if (s2ProgramIsUpdate && !s2Group.romfs) {
+      throw new Error('Cannot pack ' + s2Group.prefix + ': missing Switch 2 program 0 RomFS');
+    }
 
-    const p0Update =
-      groups.get('/updates/' + s2Version) ||
-      allGroups
-        .filter((group) => !group.switch2 && group.prefix.startsWith('/updates/') && group.romfs)
-        .sort((a, b) => (b.romfs.source.version >>> 0) - (a.romfs.source.version >>> 0))[0] ||
-      null;
+    const p0Update = s2ProgramIsUpdate
+      ? s2Group
+      : groups.get('/updates/' + s2Version) ||
+        allGroups
+          .filter((group) => !group.switch2 && group.prefix.startsWith('/updates/') && group.romfs)
+          .sort((a, b) => (b.romfs.source.version >>> 0) - (a.romfs.source.version >>> 0))[0] ||
+        null;
     const baseGroup = groups.get('/base') || null;
     const primaryRomfsGroup = (p0Update && p0Update.romfs ? p0Update : null) || (baseGroup && baseGroup.romfs ? baseGroup : null);
 
@@ -374,10 +403,14 @@ function planPackages(views, title, edition = 'switch2') {
         layerSpecs.push({ view: dlcGroup.romfs, label: 'enhanced dlc' });
         continue;
       }
+      if (flattenUnrealChunks && s2ProgramIsUpdate && !dlcGroup.exefs &&
+          isCompanionUnrealChunk(dlcGroup.romfs, baseFilePaths)) {
+        layerSpecs.push({ view: dlcGroup.romfs, label: 'companion Unreal chunk; also retained as DLC' });
+      }
       addonGroups.push(dlcGroup);
     }
 
-    if (s2Group.romfs) {
+    if (s2Group.romfs && !s2ProgramIsUpdate) {
       layerSpecs.push({ view: s2Group.romfs, label: 'program 1' });
     }
 
@@ -388,6 +421,7 @@ function planPackages(views, title, edition = 'switch2') {
       kind: KIND.base,
       titleId: s2Source.runtimeProgramId || s2Source.contentTitle || title,
       version: s2Version,
+      editionControlKey: s2ProgramIsUpdate ? s2Source.contentTitle + ':' + s2Version : undefined,
       flags: 0,
       root,
       exefsDir: null,
@@ -477,9 +511,13 @@ function planPackages(views, title, edition = 'switch2') {
           ? title
           : kind === KIND.addonUpdate
             ? patchedAddonId(source)
-            : source.contentTitle || title,
+            : group.switch2 && source.runtimeProgramId
+              ? source.runtimeProgramId
+              : source.contentTitle || title,
       version: source.version >>> 0,
       controlKey: source.contentTitle + ':' + source.version,
+      editionControlKey: group.switch2 && source.metaType === 0x81 && !source.programIndex
+        ? source.contentTitle + ':' + source.version : undefined,
       flags: 0,
       root,
       exefsDir: null,
@@ -542,7 +580,7 @@ function tlv(type, payload) {
 // same records (sorted by type) as the reference packer (a55uka/nup), so `nup edit` etc. treat them the same
 function buildMeta(pack, { npdm, mainHead, name, control, updateControls }) {
   const records = [];
-  if (pack.switch2) control = control?.switch2 || control;
+  if (pack.switch2) control = updateControls?.[pack.editionControlKey] || control?.switch2 || control;
   else if (pack.kind === KIND.update) control = updateControls?.[pack.controlKey] || null;
   else if (pack.kind !== KIND.base) control = null;
 
@@ -833,9 +871,10 @@ async function pullImage(client, ftpPath, size, consumers, shouldStop, onProgres
   for (const consumer of consumers) consumer.finish(ftpPath);
 }
 
-async function packNup({ host, port, views, title, name, output, edition = 'switch2', control = null, updateControls = {}, shouldStop = () => false, onProgress }) {
+async function packNup({ host, port, views, title, name, output, edition = 'switch2', control = null, updateControls = {},
+  flattenUnrealChunks = process.env.YOINK_FLATTEN_UNREAL_CHUNKS === '1', shouldStop = () => false, onProgress }) {
   const targets = editionOutputs(output, edition).map((target) => {
-    const packages = planPackages(views, title, target.edition);
+    const packages = planPackages(views, title, target.edition, { flattenUnrealChunks });
     const plan = layout(packages);
     return {
       ...target,

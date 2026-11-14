@@ -12,7 +12,10 @@ const addon = { contentTitle: '0100e95004039001', storage: 4, version: 0 };
 // Mock the console-facing content/program services; exercise the actual mount
 // planner, RomFS parsing, ExeFS enumeration and failure handling together.
 function fixture(t, { missingProgram = false, failure, badHeader = false, secondStorageAbsent = false,
-  title: selectedTitle = title, readControl = async () => null, baseFailure, licenseFailure } = {}) {
+  updateProgramAbsent = false, secondProgramId = runtimeId, updateProgramId,
+  title: selectedTitle = title, readControl = async () => null, baseFailure, licenseFailure,
+  updateFailure, unreadableBase = false, identityFailure } = {}) {
+  const firstProgramId = updateProgramId || selectedTitle;
   const selectedPatch = { ...patch,
     contentTitle: (BigInt('0x' + selectedTitle) + 0x800n).toString(16).padStart(16, '0') };
   const calls = [];
@@ -38,7 +41,8 @@ function fixture(t, { missingProgram = false, failure, badHeader = false, second
     calls.push('verify:' + [...new Set(sources.map((source) => source.programIndex))].join(','));
   });
   t.mock.method(content, 'resolveProgramContent', async (options) => {
-    if (options.programIndex && (missingProgram || (secondStorageAbsent && options.storage === 5))) {
+    if (options.programIndex && (missingProgram || (updateProgramAbsent && options.update) ||
+      (secondStorageAbsent && options.storage === 5))) {
       throw resultError('GetContentIdByTypeAndIdOffset', 0xa05);
     }
     return sourceFor(options);
@@ -48,6 +52,7 @@ function fixture(t, { missingProgram = false, failure, badHeader = false, second
     async openCode() { calls.push('base:exefs'); if (baseFailure) throw baseFailure; return own(); },
     async openUpdate(options) {
       calls.push('program' + (options.programIndex || 0) + ':' + options.section);
+      if (!options.programIndex && updateFailure) throw updateFailure;
       if (options.programIndex && options.section === 'exefs' && failure) throw failure;
       return own();
     },
@@ -82,10 +87,11 @@ function fixture(t, { missingProgram = false, failure, badHeader = false, second
     domain: {
       oneHandle(reply) { handles.add(reply.handle); return reply.handle; },
       async send(session, label) {
-        if (label === 'Read selected NCA ProgramId') {
+        if (label === 'Read selected NCA ProgramId' || label === 'Check installed Switch 2 Edition') {
+          if (identityFailure) throw identityFailure;
           const filename = bytes.subarray(0x2000, 0x2301).toString();
           const data = Buffer.alloc(8);
-          data.writeBigUInt64LE(BigInt('0x' + (filename.includes('program-1') ? runtimeId : selectedTitle)));
+          data.writeBigUInt64LE(BigInt('0x' + (filename.includes('program-1') ? secondProgramId : firstProgramId)));
           return { result: 0, data };
         }
         assert.equal(label, 'OpenDataStorageByPath');
@@ -97,7 +103,9 @@ function fixture(t, { missingProgram = false, failure, badHeader = false, second
     filesystem: {
       async pathMethod() { return { result: 0, handle: own() }; },
       async verifiedBytes() { return directoryBytes; },
-      async readStorage(session, handle, offset, length) { return image.subarray(offset, offset + length); },
+      async readStorage(session, handle, offset, length) {
+        return unreadableBase ? Buffer.alloc(length) : image.subarray(offset, offset + length);
+      },
     },
   };
   // Track filenames independently: validation must read both executable headers.
@@ -124,6 +132,120 @@ test('Switch 2 executable is validated before its RomFS and DLC mounts', async (
   assert.equal(dlc.kind, 2, 'ordinary DLC remains deferred');
 });
 
+test('an update whose program 0 is a Switch 2 program is mounted as the edition', async (t) => {
+  const f = fixture(t, { updateProgramId: runtimeId, missingProgram: true });
+  const prepared = await f.run();
+  assert.ok(prepared.views.some((view) => view.path === '/switch2/updates/1114112/exefs'));
+  assert.ok(prepared.views.some((view) => view.path === '/switch2/updates/1114112/romfs'));
+  assert.ok(!prepared.views.some((view) => view.path.startsWith('/updates/')));
+  assert.ok(!f.calls.includes('program1:exefs'));
+  assert.ok(!prepared.views.some((view) => view.path === '/switch2/base/exefs'));
+  assert.ok(f.calls.indexOf('program0:exefs') < f.calls.indexOf('program0:romfs'));
+  assert.ok(f.calls.indexOf('program0:romfs') < f.calls.indexOf('storage:dlc'));
+});
+
+test('program 0 edition failures stop before RomFS, DLC or FTP verification', async (t) => {
+  const f = fixture(t, { updateProgramId: runtimeId, badHeader: true });
+  await assert.rejects(f.run(), /invalid \/main header/);
+  assert.ok(!f.calls.includes('program0:romfs'));
+  assert.ok(!f.calls.includes('storage:dlc'));
+  assert.ok(!f.calls.some((call) => call.startsWith('verify:')));
+});
+
+test('an installed program 0 edition CodeFS error is fatal', async (t) => {
+  const failure = resultError('Open selected game CodeFS', 0x408);
+  const f = fixture(t, { updateProgramId: runtimeId, updateFailure: failure });
+  const partialViews = [];
+  await assert.rejects(f.run({ onView: (view) => partialViews.push(view.path) }), (error) => error.source?.runtimeProgramId === runtimeId &&
+    error.nativeResult?.canonical === 0x408 && error.mountPath === '/switch2/updates/1114112/exefs');
+  assert.ok(!f.calls.includes('program0:romfs'));
+  assert.ok(!f.calls.includes('storage:dlc'));
+  assert.deepEqual(partialViews, ['/base/romfs', '/base/exefs']);
+});
+
+test('edition updates cannot be consumed as recovery for an unreadable Switch 1 base', async (t) => {
+  const f = fixture(t, { updateProgramId: runtimeId, unreadableBase: true });
+  await assert.rejects(f.run({ images: true, edition: 'switch1' }), /no matching update is selected/);
+  assert.ok(!f.calls.includes('program0:romfs'));
+  assert.ok(!f.calls.includes('program0:exefs'));
+});
+
+test('update classification propagates identity failures before mounting files', async (t) => {
+  const failure = new Error('Console response timed out');
+  const f = fixture(t, { identityFailure: failure });
+  await assert.rejects(f.run(), (error) => error === failure);
+  assert.deepEqual(f.calls, []);
+});
+
+test('disabling editions never reclassifies a program 0 edition as a Switch 1 update', async (t) => {
+  const previous = process.env.YOINK_NO_SWITCH2;
+  process.env.YOINK_NO_SWITCH2 = '1';
+  t.after(() => {
+    if (previous === undefined) delete process.env.YOINK_NO_SWITCH2;
+    else process.env.YOINK_NO_SWITCH2 = previous;
+  });
+  const f = fixture(t, { updateProgramId: runtimeId });
+  const prepared = await f.run({ images: true });
+  assert.ok(prepared.views.every((view) => !view.path.startsWith('/updates/') && !view.path.startsWith('/switch2/')));
+  assert.ok(!f.calls.includes('program0:romfs'));
+  assert.ok(!f.calls.includes('program0:exefs'));
+});
+
+test('a Switch 1 edition skips an update whose program 0 is a Switch 2 program', async (t) => {
+  const f = fixture(t, { updateProgramId: runtimeId });
+  const prepared = await f.run({ images: true, edition: 'switch1' });
+  assert.ok(!prepared.views.some((view) => view.path.startsWith('/switch2/')));
+  assert.ok(!prepared.views.some((view) => view.path.startsWith('/updates/')));
+  assert.ok(!f.calls.includes('program0:romfs'));
+  assert.ok(!f.calls.includes('program0:exefs'));
+});
+
+test('a program 0 edition keeps the update control metadata', async (t) => {
+  const base = { name: 'Base', nacp: Buffer.alloc(0x4000) };
+  const edition = { name: 'Edition' };
+  const f = fixture(t, { updateProgramId: runtimeId,
+    readControl: async (attachment, title, storages, options) => options?.update ? edition : base });
+  const prepared = await f.run({ images: true });
+  assert.equal(prepared.control.switch2, edition);
+  assert.equal(prepared.control.nacp, base.nacp);
+  assert.equal(prepared.control.name, base.name, 'Switch 1 metadata must not use the edition icon fallback');
+  assert.ok(!prepared.views.some((view) => view.path === '/switch2/base/exefs'));
+});
+
+test('a program 0 edition prefers Acd_1 metadata over readable generic root metadata', async (t) => {
+  const base = { name: 'Pikmin 4', nacp: Buffer.alloc(0x4000, 1), icon: Buffer.from('base') };
+  const generic = { name: 'Pikmin 4', version: '2.0.0', icon: Buffer.from('generic update') };
+  const edition = { name: 'Pikmin 4 – Nintendo Switch 2 Edition + Dandori Academy',
+    version: '2.0.0', nacp: Buffer.alloc(0x4000, 2), icon: Buffer.from('edition'), metadataPath: '/Acd_1/control.nacp' };
+  const requests = [];
+  const f = fixture(t, { updateProgramId: runtimeId, missingProgram: true,
+    readControl: async (attachment, title, storages, options) => {
+      requests.push(options);
+      return !options?.update ? base : options.programIndex === 1 ? edition : generic;
+    } });
+  const prepared = await f.run({ images: true, edition: 'both' });
+  assert.equal(prepared.control.name, base.name);
+  assert.equal(prepared.control.switch2, edition);
+  assert.equal(prepared.updateControls[patch.contentTitle + ':' + patch.version], edition);
+  assert.equal(requests.filter((options) => options?.update).length, 1, 'reuse the preferred metadata instead of reading the generic root');
+  assert.ok(!f.calls.includes('program1:exefs'), 'metadata directory 1 does not require an executable at program index 1');
+});
+
+test('a program 0 edition falls back to its root Control when Acd_1 is unavailable', async (t) => {
+  const generic = { name: 'Edition at root', version: '2.0.0', metadataPath: '/control.nacp' };
+  const requests = [];
+  const f = fixture(t, { updateProgramId: runtimeId,
+    readControl: async (attachment, title, storages, options) => {
+      if (!options?.update) return { name: 'Base', icon: Buffer.from('base') };
+      requests.push(options.programIndex || 0);
+      return options.programIndex === 1 ? null : generic;
+    } });
+  const prepared = await f.run({ images: true });
+  assert.deepEqual(requests, [1, 0]);
+  assert.equal(prepared.control.switch2, generic);
+  assert.equal(prepared.updateControls[patch.contentTitle + ':' + patch.version], generic);
+});
+
 test('CodeFS timeout aborts preparation before DLC or FTP verification', async (t) => {
   const failure = new Error('Console response timed out; restart the application');
   const f = fixture(t, { failure });
@@ -138,6 +260,30 @@ test('absent Program[1] permits ordinary game preparation', async (t) => {
   const prepared = await f.run();
   assert.ok(!prepared.views.some((view) => view.path.startsWith('/switch2/')));
   assert.ok(prepared.views.some((view) => view.path.startsWith('/dlc/')));
+});
+
+test('Program[1] from the base content is used when the update has none', async (t) => {
+  const edition = { name: 'Edition' };
+  const f = fixture(t, { updateProgramAbsent: true,
+    readControl: async (attachment, title, storages, options) => options?.programIndex ? edition : null });
+  const prepared = await f.run({ images: true });
+  assert.ok(f.calls.includes('program1:exefs'));
+  assert.equal(prepared.control.switch2, edition);
+  assert.ok(prepared.views.some((view) => view.path === '/switch2/base/exefs'));
+  assert.ok(prepared.views.some((view) => view.path === '/switch2/base/romfs'));
+});
+
+test('an ordinary second base program is not packed as a Switch 2 Edition', async (t) => {
+  const f = fixture(t, { updateProgramAbsent: true, secondProgramId: title });
+  const prepared = await f.run();
+  assert.ok(!prepared.views.some((view) => view.path.startsWith('/switch2/')));
+});
+
+test('an ordinary second update program is not mounted as a Switch 2 Edition', async (t) => {
+  const f = fixture(t, { secondProgramId: title });
+  const prepared = await f.run();
+  assert.ok(!prepared.views.some((view) => view.path.startsWith('/switch2/')));
+  assert.ok(!f.calls.includes('program1:exefs'));
 });
 
 test('a failed installed CodeFS is not hidden by missing content on another storage', async (t) => {
@@ -188,7 +334,9 @@ test('key-card icon fallback takes the whole control, NACP included, from its ma
   assert.equal(prepared.control.iconSource, iconSource);
   assert.equal(prepared.updateControls['0400e140216d4800:' + patch.version], update);
   assert.equal(controls.length, 2, 'fallback control is reused for the update package');
-  assert.deepEqual(controls[1], { title: cardTitle, storages: [4],
+  const { shouldStop, ...options } = controls[1].options;
+  assert.equal(shouldStop(), false);
+  assert.deepEqual({ ...controls[1], options }, { title: cardTitle, storages: [4],
     options: { update: { contentTitle: '0400e140216d4800', version: patch.version } } });
 });
 

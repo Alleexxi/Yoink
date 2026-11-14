@@ -493,7 +493,8 @@ function buildIndex(views, { images = false } = {}) {
   return bytes;
 }
 
-async function prepareGame({ attachment: a, title, images = false, edition = 'all', shouldStop = () => false }) {
+async function prepareGame({ attachment: a, title, images = false, edition = 'all', shouldStop = () => false,
+  onView = () => {} }) {
   const views = [];
   const sources = [];
   const absentSources = [];
@@ -647,6 +648,7 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
       size: mounted.size || 0,
       source: mounted.source,
     });
+    onView(views[views.length - 1]);
     return { ...mounted, entries };
   }
 
@@ -696,30 +698,54 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
     return !skipped.has(version) && !stale;
   });
 
-  const { base, composedUpdate } = await prepareBaseProgram({
-    title, mountView, installed, updateGroups, readCodeHeader,
-  });
+  const absentProgram = new Set([0xa05, 0xe05, 0x21005, 0x20a05]);
+  const missingProgram = new Set([0xa05, 0xe05]);
 
-  const metadata = images
-    ? await prepareControl({ attachment: a, title, base, updateGroups, composedUpdate, shouldStop })
-    : { control: null, updateControls: {} };
-  let { control } = metadata;
-  const { updateControls } = metadata;
-
-  for (const group of updateGroups) {
-    if (composedUpdate && group[0].contentTitle === composedUpdate.contentTitle && group[0].version === composedUpdate.version) continue;
-    const prefix = '/updates/' + group[0].version;
-
-    const candidates = group.map((item) => ({
+  function updateCandidate(item, programIndex = 0) {
+    return {
       storage: item.storage,
       update: { contentTitle: item.contentTitle, version: item.version },
-    }));
-    const update = await mountView(prefix, 'romfs', candidates);
-    await mountView(
-      prefix,
-      'exefs',
-      candidates.filter((candidate) => candidate.storage === update.source.storage),
-    );
+      programIndex,
+    };
+  }
+
+  async function readProgramId(candidate) {
+    const source = await resolveProgramContent({
+      s: a.s, root: a.root, domain: a.domain, service: a.service,
+      title, storage: candidate.storage, update: candidate.update,
+      programIndex: candidate.programIndex,
+    });
+    const filename = Buffer.alloc(0x301);
+    filename.write(source.contentPath);
+    await a.s.write(a.s.base + 0x2000, filename);
+    const identity = success(await a.domain.send(
+      a.s, 'Read selected NCA ProgramId', a.root,
+      pathRequest(618, Buffer.from([source.attributes]), a.s.base + 0x2000),
+    ), 'Read selected NCA ProgramId');
+    return identity.data.readBigUInt64LE().toString(16).padStart(16, '0');
+  }
+
+  // A Switch 2 Edition card can publish its Switch 2 program as program 0 of the
+  // update instead of a Program[1]. Classify updates before mounting so the
+  // packer sees such a group as an edition source.
+  const switch2Updates = new Set();
+  for (const group of title.startsWith('01') ? updateGroups : []) {
+    throwIfCancelled(shouldStop);
+    for (const item of group) {
+      let programId;
+      try {
+        programId = await readProgramId(updateCandidate(item));
+      } catch (error) {
+        if (absentProgram.has(error.nativeResult?.canonical)) continue;
+        throw error;
+      }
+      if (programId.startsWith('04')) {
+        switch2Updates.add(group);
+        console.log('Switch 2 Edition program 0: ' + programId +
+          ' (update ' + item.version + ', storage ' + item.storage + ')');
+        break;
+      }
+    }
   }
 
   // Open the edition's code before DLC/data-patch storage consumes more FS resources.
@@ -730,13 +756,72 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
   const includeEdition = title.startsWith('01') &&
     !process.env.YOINK_NO_SWITCH2 && !process.env.OZ_NO_SWITCH2 &&
     !(images && edition === 'switch1');
+  let editionFound = false;
+
+  // Recover a Switch 1 base only with a Switch 1 update. An edition update must
+  // retain its own runtime identity and must never be consumed as /base.
+  const originalUpdates = updateGroups.filter((group) => !switch2Updates.has(group));
+  const { base, composedUpdate } = await prepareBaseProgram({
+    title, mountView, installed, updateGroups: originalUpdates, readCodeHeader,
+  });
+  const metadata = images
+    ? await prepareControl({ attachment: a, title, base,
+        updateGroups: includeEdition ? updateGroups : originalUpdates,
+        baseUpdateGroups: originalUpdates, editionUpdateGroups: includeEdition ? [...switch2Updates] : [],
+        composedUpdate, shouldStop })
+    : { control: null, updateControls: {} };
+  let { control } = metadata;
+  const { updateControls } = metadata;
+
+  for (const group of updateGroups) {
+    if (composedUpdate && group[0].contentTitle === composedUpdate.contentTitle && group[0].version === composedUpdate.version) continue;
+    const isEdition = switch2Updates.has(group);
+    if (isEdition && !includeEdition) continue;
+
+    const editionSource = isEdition;
+    const prefix = (editionSource ? '/switch2/updates/' : '/updates/') + group[0].version;
+    const candidates = group.map((item) => updateCandidate(item));
+    if (editionSource) {
+      const program = await mountView(prefix, 'exefs', candidates);
+      await validateProgramEntries(program.entries, (filename, size) => readCodeHeader(program, filename, size));
+      await mountView(prefix, 'romfs', candidates.filter((candidate) => candidate.storage === program.source.storage));
+    } else {
+      const update = await mountView(prefix, 'romfs', candidates);
+      await mountView(prefix, 'exefs', candidates.filter((candidate) => candidate.storage === update.source.storage));
+    }
+    if (editionSource) {
+      editionFound = true;
+      if (images && group[0].version > editionControlVersion) {
+        const editionControl = updateControls[group[0].contentTitle + ':' + group[0].version];
+        if (editionControl) {
+          control = { ...control, switch2: editionControl };
+          editionControlVersion = group[0].version;
+          console.log('Switch 2 Control: ' + (editionControl.name || '(no name)'));
+        } else {
+          console.warn('Switch 2 Control unavailable for update ' + group[0].version +
+            '; NUP name, icon and NACP will use base metadata when available.');
+        }
+      }
+    }
+  }
+
   for (const group of includeEdition ? updateGroups : []) {
+    if (switch2Updates.has(group)) continue;
     const prefix = '/switch2/updates/' + group[0].version;
-    const candidates = group.map((item) => ({
-      storage: item.storage,
-      update: { contentTitle: item.contentTitle, version: item.version },
-      programIndex: 1,
-    }));
+    const candidates = [];
+    for (const item of group) {
+      cancelled();
+      const candidate = updateCandidate(item, 1);
+      try {
+        if ((await readProgramId(candidate)).startsWith('04')) candidates.push(candidate);
+      } catch (error) {
+        if (!absentProgram.has(error.nativeResult?.canonical)) throw error;
+      }
+    }
+    if (!candidates.length) {
+      console.log('No Switch 2 Edition program at ' + prefix + ': no installed 04... Program[1]');
+      continue;
+    }
 
     let program;
 
@@ -744,12 +829,13 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
       program = await mountView(prefix, 'exefs', candidates);
     } catch (error) {
       // Only NCM reporting no Program[1] establishes that this is not an edition.
-      if (error.source || ![0xa05, 0xe05].includes(error.nativeResult?.canonical)) throw error;
+      if (error.source || !missingProgram.has(error.nativeResult?.canonical)) throw error;
       console.log('No Switch 2 Edition program at ' + prefix + ': ' + error.message);
       continue;
     }
 
     await validateProgramEntries(program.entries, (filename, size) => readCodeHeader(program, filename, size));
+    editionFound = true;
     await mountView(
       prefix,
       'romfs',
@@ -767,6 +853,63 @@ async function prepareGame({ attachment: a, title, images = false, edition = 'al
         editionControlVersion = group[0].version;
         console.log('Switch 2 Control: ' + (editionControl.name || '(no name)'));
       }
+    }
+  }
+
+  // If no update supplied the edition, also check the base content for Program[1].
+  if (includeEdition && !editionFound) {
+    const storages = [];
+    for (const source of [base.source.originalSource, base.source]) {
+      if (source && !storages.includes(source.storage)) storages.push(source.storage);
+    }
+    for (const item of installed) {
+      if (!storages.includes(item.storage)) storages.push(item.storage);
+    }
+
+    const prefix = '/switch2/base';
+    let editionStorage;
+    for (const storage of storages) {
+      throwIfCancelled(shouldStop);
+      let programId;
+      try {
+        programId = await readProgramId({ storage, programIndex: 1 });
+      } catch (error) {
+        // ContentNotFound / ContentMetaNotFound, or an unavailable removable storage.
+        if (absentProgram.has(error.nativeResult?.canonical)) continue;
+        throw error;
+      }
+      if (!programId.startsWith('04')) continue;
+      editionStorage = storage;
+      break;
+    }
+
+    if (editionStorage !== undefined) {
+      const candidates = [{ storage: editionStorage, programIndex: 1 }];
+      try {
+        const program = await mountView(prefix, 'exefs', candidates);
+        await validateProgramEntries(program.entries, (filename, size) => readCodeHeader(program, filename, size));
+        await mountView(prefix, 'romfs', candidates);
+
+        if (images) {
+          let editionControl = await readControl(a, title, [editionStorage], { programIndex: 1 });
+          const group = updateGroups[0];
+          if (!editionControl && group) {
+            editionControl = await readControl(a, title, group.map((item) => item.storage), {
+              update: { contentTitle: group[0].contentTitle, version: group[0].version },
+              programIndex: 1,
+            });
+          }
+          if (editionControl) {
+            control = { ...control, switch2: editionControl };
+            console.log('Switch 2 Control: ' + (editionControl.name || '(no name)'));
+          }
+        }
+      } catch (error) {
+        if (error.source || !missingProgram.has(error.nativeResult?.canonical)) throw error;
+        console.log('No Switch 2 Edition program at ' + prefix + ': ' + error.message);
+      }
+    } else if (!updateGroups.length) {
+      console.log('No Switch 2 Edition program at ' + prefix + ': nothing installed at Program[1]');
     }
   }
 

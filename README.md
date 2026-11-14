@@ -54,24 +54,51 @@ If a data connection goes quiet for 5 minutes, or drops before the whole file ha
 
 #### Switch 2 Editions
 
-The game selection list marks `[Switch 2 Edition]` when an installed base or update contains a Switch 2 program at program index 1. This checks installed content, not whether an upgrade is available online or its Upgrade Pack is owned.
+The game selection list marks `[Switch 2 Edition]` when an installed base or update contains a Switch 2 program at program index 1, or when a game-card update's program 0 is a `0400...` program. This checks installed content, not whether an upgrade is available online or its Upgrade Pack is owned.
 
-A Switch 2 Edition ships a second program (program index 1) inside its update, along with an Upgrade Pack DLC and the updated program 0 RomFS. `--edition` chooses how the `.nup` is packed:
+Switch 2 Editions can put the enhanced program at program index 1 in the base or update, alongside the original Switch 1 program. Some game cards, including Pikmin 4 Switch 2 Edition, instead publish the Switch 2 program as the update's program 0, with no program 1. Yoink reads the NCA's runtime ProgramId to recognize either layout. `--edition` chooses how the `.nup` is packed:
 
 ```
 node yoink.cjs --nup game.nup --edition switch2
 ```
 
-- `switch2` (the default) packs a self-contained Switch 2 Edition base package with the Switch 2 `0400...` title ID, program 1 ExeFS, and a flattened RomFS combining updated program 0 + Switch 2 Upgrade Pack DLC + program 1 (skipping the unused v1.0.0 base RomFS and dummy unlock DLCs).
-- `switch1` packs the original Switch 1 program (base + program 0 update + DLC).
+- `switch2` (the default) packs a self-contained Switch 2 Edition base package with the Switch 2 `0400...` title ID, the Switch 2 ExeFS, and a flattened RomFS combining the primary program RomFS + Switch 2 Upgrade Pack DLC + any program 1 layer. For a program 0 edition, the update's own RomFS is the primary and is included once. Unused original base data and dummy unlock DLCs are omitted.
+- `switch1` packs the original Switch 1 program (base + Switch 1 updates + DLC). An update whose program 0 is a Switch 2 program is excluded.
 - `both` writes two files in one run — `game.nup` (Switch 1) and `game-switch2.nup` (Switch 2) — sharing the common RomFS downloads so shared layers are only pulled once.
 - `all` keeps every dumped package in one file, the way the NUP spec lays a dump out: base, program 0 update, the Switch 2 program as an update with its own `0400...` id, the Upgrade Pack and its data patch. The emulator picks the program and layers the RomFS.
 
 For a game that isn't a Switch 2 Edition, `--edition` makes no difference: there's only one program to pack.
 
+To test merging Pikmin 4's companion Unreal chunk into its Switch 2 base, enable
+the experimental option in PowerShell before dumping:
+
+```powershell
+$env:YOINK_FLATTEN_UNREAL_CHUNKS = '1'
+node yoink.cjs <path-to-ns2jb-run> 0100B7C00933A000 --nup pikmin4-switch2-merged.nup --edition switch2 --no-tui
+```
+
+This copies the four-file `__chunks_1` / `pakchunk1-Sage` add-on into the edition's
+primary RomFS alongside `pakchunk0-Sage`. It retains the original add-on package
+for games that query add-on availability. The DLC image is downloaded once and
+identical payloads share stored data within the NUP. A matching project/platform,
+chunk marker and complete `.pak`/`.ucas`/`.utoc` set are required; unrelated DLC
+is left separate. This applies to the Switch 2 output of `switch2` and `both`;
+`switch1` and `all` retain their normal package layouts. Debug's package plan
+honors the same option. Set it to `'0'` to return to normal packing. Whether this
+restores the in-game edition banner/options still needs an emulator test.
+
 Switch 2 output uses the edition's own name, icon, localized NACP and display version from
-`/Acd_1` inside the update's Control content, when available. Switch 1 output retains the
-base game's Control data. With `all`, the edition metadata is carried on its program package.
+`/Acd_1` in shared Control content. A program 0 edition also prefers `/Acd_1` when
+present: its executable index and metadata directory index can differ, as on
+Pikmin 4. If that directory is unavailable, the update's root Control is tried.
+If edition Control content is unavailable, base metadata is used;
+the display version may therefore remain `1.0.0` even though the package has the update's
+numeric version and `0400...` title ID. Switch 1 output retains its own Control data.
+With `all`, the edition metadata is carried on its program package.
+Control filesystem opens use the selected NCA's own ProgramId, which can be
+`0400...` even when NCM lists the update under a `0100...` owner. The complete
+official NACP is preserved, including its add-on-content base ID and save owner;
+these identifiers are not rewritten to match the package title ID.
 
 Yoink opens and checks the Switch 2 executable before its RomFS and the DLC mounts.
 An installed edition whose executable cannot be opened stops preparation; it is not
@@ -107,8 +134,32 @@ node yoink.cjs debug <path-to-ns2jb-run> <title id>
 It prints installed content metadata and attempts the same base, update, DLC, and
 Switch 2 edition mounts used by a dump. The JSON report includes each layer's
 storage, content ID, NCA path, size, file counts, and available Control/NACP/icon
-details. It does not start FTP or write a NUP. Leave out the title ID to select a
-game from the library.
+details. Debug report version 2 also includes:
+
+- SHA-256 hashes of the running source files, Node/platform details and active content-selection overrides, so captures from older builds can be identified.
+- Independent program 0/1 runtime ID probes for the installed base and updates, even if later game mounts fail.
+- Per-storage Control attempts at the root, `/Acd_0` and `/Acd_1`, plus a separate Control NCA at content index 1. These additional paths are diagnostic probes; they do not change which metadata a normal dump selects.
+- Exact failing stages and native result codes, Control NCA identities, directory listings, available icon filenames, NACP sizes and NACP/icon hashes. A missing icon can be distinguished from an unreadable NACP or an unavailable Control NCA.
+- The ProgramId actually supplied to the Control open, NACP add-on/save identifiers, and the planned Switch 2 packages and RomFS layers. This shows when DLC is retained as its own package rather than merged into the primary RomFS.
+- Completed layers retained after a later preparation error, file samples (up to 64 files per layer), DLC enhancement markers and overlap counts against the edition's primary RomFS.
+
+It does not start FTP or write a NUP. Leave out the title ID to select a game from
+the library. Debug probes open extra metadata files and can take longer than a
+normal launch. Cancellation still releases the console attachment.
+Control file/directory opens check the console result before decoding a returned
+handle. Missing optional edition paths therefore retain their native error and
+do not stop the remaining metadata probes. Directory inventories follow the
+edition directories actually listed at the root.
+
+For a Pikmin 4 capture in PowerShell, use your current ns2jb run path:
+
+```powershell
+node yoink.cjs debug "C:\path\to\ns2jb\runs\switch2-YOUR-RUN" 0100B7C00933A000 2>&1 | Tee-Object -FilePath debug.txt
+```
+
+Share the complete text capture, including the JSON report at the end. If an
+extra Control path succeeds while the normal path fails, its NCA and directory
+details can guide the next metadata fix.
 
 ### Batch dumps
 

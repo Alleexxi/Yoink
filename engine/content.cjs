@@ -1,5 +1,6 @@
 const { inflateRawSync } = require('node:zlib');
 const { parseDlcMetadata } = require('./dlc.cjs');
+const { sourceDetails, errorDetails, controlSummary } = require('./diagnostics.cjs');
 const { success, idBytes, fixedOutput, pathRequest, resultError, withCleanup, closeHandles, throwIfCancelled } = require('./protocol.cjs');
 
 // read nca content!
@@ -481,19 +482,66 @@ function controlDetails(nacp) {
   return { name, publisher, version };
 }
 
+// The run's high-level FS helpers can decode a moved handle before checking the
+// result. Open optional Control paths through pathMethod so a missing path keeps
+// its native error instead of becoming "Expected one moved session handle".
+async function openControlPath({ s, domain, filesystem }, control, filename, directory = false) {
+  const mode = Buffer.alloc(4);
+  mode.writeUInt32LE(directory ? 3 : 1);
+  const label = 'Open Control ' + (directory ? 'directory ' : 'file ') + filename;
+  return domain.oneHandle(success(await filesystem.pathMethod(s, control, directory ? 9 : 8, filename, mode), label));
+}
+
+async function listControlDirectory(context, control, filename, shouldStop) {
+  const { s, filesystem } = context;
+  const directory = await openControlPath(context, control, filename, true);
+  return withCleanup(async () => {
+    const entries = [];
+    const capacity = 32;
+    for (;;) {
+      throwIfCancelled(shouldStop);
+      const address = s.base + 0x6000;
+      const reply = success(await s.ipc('Read Control directory ' + filename, directory, 0, Buffer.alloc(0), {
+        receive: [{ address, size: capacity * 0x310, mode: 0 }],
+      }), 'Read Control directory ' + filename);
+      const count = Number(reply.data.readBigUInt64LE());
+      if (count > capacity) throw new Error('Invalid Control directory entry count: ' + count);
+      if (!count) return entries;
+      const bytes = await filesystem.verifiedBytes(s, address, count * 0x310, { directory: filename });
+      if (bytes.length !== count * 0x310) throw new Error('Control directory read was short');
+      for (let i = 0; i < count; i++) {
+        const row = bytes.subarray(i * 0x310, (i + 1) * 0x310);
+        const end = row.subarray(0, 0x301).indexOf(0);
+        if (end < 0) throw new Error('Invalid Control directory filename');
+        entries.push({ name: new TextDecoder('utf-8', { fatal: true }).decode(row.subarray(0, end)),
+          type: row[0x304], size: Number(row.readBigUInt64LE(0x308)) });
+      }
+    }
+  }, () => s.close(directory));
+}
+
 // a title's control content: the whole NACP (for the nup's TLV 0x0002) plus its name/publisher/
 // version and the default icon. tries each storage until one answers
 async function readControl({ s, root, domain, service, filesystem }, title, storages = [4, 5, 2],
-  { update, programIndex = 0 } = {}) {
+  { update, programIndex = 0, controlIndex = 0, controlPrefix,
+    diagnostics, inspect = false, shouldStop = () => false } = {}) {
   const seen = new Set();
   for (const storage of storages) {
     if (seen.has(storage)) continue;
     seen.add(storage);
 
     const handles = [];
+    const prefix = controlPrefix ?? (programIndex ? '/Acd_' + programIndex : '');
+    const attempt = diagnostics ? {
+      storage, title, update, programIndex, controlIndex, prefix: prefix || '/', warnings: [],
+    } : null;
+    if (attempt) diagnostics.push(attempt);
+    let stage = 'resolve Control NCA';
     const result = await withCleanup(async () => {
       try {
-        const source = await resolveControlContent({ s, domain, service, title, storage, update });
+        throwIfCancelled(shouldStop);
+        const source = await resolveControlContent({ s, domain, service, title, storage, update, programIndex: controlIndex });
+        if (attempt) attempt.source = sourceDetails(source);
         const filename = Buffer.alloc(0x301);
         filename.write(source.contentPath);
         await s.write(s.base + 0x2000, filename);
@@ -501,42 +549,111 @@ async function readControl({ s, root, domain, service, filesystem }, title, stor
         input[0] = source.attributes;
         input.writeUInt32LE(3, 4);
         idBytes(title).copy(input, 8);
+        // The owner remains the 0100... application in NCM, but a program-0
+        // edition's Control NCA can carry 0400.... FS checks the NCA identity
+        // against this argument, so using the owner causes InvalidNcaId.
+        stage = 'read Control NCA ProgramId';
+        try {
+          const identity = success(await domain.send(s, 'Read Control NCA ProgramId', root,
+            pathRequest(618, Buffer.from([source.attributes]), s.base + 0x2000)), 'Read Control NCA ProgramId');
+          source.runtimeProgramId = identity.data.readBigUInt64LE().toString(16).padStart(16, '0');
+          idBytes(source.runtimeProgramId).copy(input, 8);
+          if (attempt) attempt.runtimeProgramId = source.runtimeProgramId;
+        } catch (error) {
+          if (attempt) attempt.warnings.push({ stage, error: errorDetails(error) });
+          if (!error.nativeResult) throw error;
+          // Preserve the existing owner-ID route if this FS cannot read an NCA
+          // identity. Debug keeps the identity failure as well as the open error.
+        }
+        if (attempt) { attempt.source = sourceDetails(source); attempt.openProgramId = input.readBigUInt64LE(8).toString(16).padStart(16, '0'); }
+        stage = 'open Control filesystem';
         const opened = success(await domain.send(
           s, 'Open installed game control metadata', root, pathRequest(10, input, s.base + 0x2000),
         ), 'Open installed game control metadata');
         const control = domain.oneHandle(opened);
         handles.push(control);
 
+        if (inspect && attempt) {
+          stage = 'inspect Control directories';
+          attempt.directories = [];
+          const pending = ['/'];
+          const seenDirectories = new Set();
+          while (pending.length && seenDirectories.size < 12) {
+            throwIfCancelled(shouldStop);
+            const directory = pending.shift();
+            if (seenDirectories.has(directory)) continue;
+            seenDirectories.add(directory);
+            const listing = { path: directory };
+            attempt.directories.push(listing);
+            try {
+              const entries = await listControlDirectory({ s, domain, filesystem }, control, directory, shouldStop);
+              listing.total = entries.length;
+              listing.entries = entries.slice(0, 128).map((entry) => ({
+                name: entry.name, type: entry.type, size: Number(entry.size || 0),
+              }));
+              listing.truncated = entries.length > 128;
+              if (directory === '/') {
+                for (const entry of entries) {
+                  if (/^Acd_\d+$/.test(entry.name)) pending.push('/' + entry.name);
+                }
+              }
+            } catch (error) {
+              listing.error = errorDetails(error);
+              if (!error.nativeResult) throw error;
+            }
+          }
+        }
+
         // Edition metadata is inside the update's shared Control NCA, under /Acd_<program index>.
-        const prefix = programIndex ? '/Acd_' + programIndex : '';
-        const nacpFile = success(await filesystem.openFile(s, control, prefix + '/control.nacp'),
-          'Open installed game control property');
-        handles.push(nacpFile.handle);
-        if (await filesystem.fileSize(s, nacpFile.handle) < 0x4000n) return null;
-        const nacp = await filesystem.readFile(s, nacpFile.handle, 0, 0x4000);
+        stage = 'open ' + prefix + '/control.nacp';
+        const nacpFile = await openControlPath({ s, domain, filesystem }, control, prefix + '/control.nacp');
+        handles.push(nacpFile);
+        stage = 'read ' + prefix + '/control.nacp';
+        const nacpSize = Number(await filesystem.fileSize(s, nacpFile));
+        if (attempt) attempt.nacpSize = nacpSize;
+        if (nacpSize < 0x4000) {
+          if (attempt) { attempt.status = 'invalid-nacp-size'; attempt.stage = stage; }
+          return null;
+        }
+        const nacp = await filesystem.readFile(s, nacpFile, 0, 0x4000);
+        if (nacp.length !== 0x4000) throw new Error('Control NACP read was short: ' + nacp.length + ' of 16384 bytes');
+        if (attempt) {
+          attempt.nacpHeaderHex = nacp.subarray(0, 0x40).toString('hex');
+          attempt.titleFormat = nacp[0x3215];
+        }
 
         let icon = null;
         try {
-          const entries = await filesystem.listDirectory(s, control, prefix || '/');
+          stage = 'list icons in ' + (prefix || '/');
+          const entries = await listControlDirectory({ s, domain, filesystem }, control, prefix || '/', shouldStop);
+          if (attempt) attempt.icons = entries.filter((entry) => /^icon_.*\.dat$/i.test(entry.name))
+            .slice(0, 128).map((entry) => ({ name: entry.name, size: Number(entry.size) }));
           const found = entries.find((entry) => /^icon_.*\.dat$/i.test(entry.name) && Number(entry.size) > 0);
           if (found) {
             const size = Number(found.size);
             if (size > 0 && size <= 4 * 1024 * 1024) {
-              const iconFile = success(await filesystem.openFile(s, control, prefix + '/' + found.name), 'Open control icon');
-              handles.push(iconFile.handle);
+              stage = 'read ' + prefix + '/' + found.name;
+              if (attempt) attempt.iconPath = prefix + '/' + found.name;
+              const iconFile = await openControlPath({ s, domain, filesystem }, control, prefix + '/' + found.name);
+              handles.push(iconFile);
               const chunks = [];
               for (let at = 0; at < size; at += 0x40000) {
-                chunks.push(await filesystem.readFile(s, iconFile.handle, at, Math.min(0x40000, size - at)));
+                chunks.push(await filesystem.readFile(s, iconFile, at, Math.min(0x40000, size - at)));
               }
               icon = Buffer.concat(chunks, size);
             }
           }
         } catch (error) {
+          if (attempt) attempt.warnings.push({ stage, error: errorDetails(error) });
           if (!error.nativeResult) throw error;
         }
 
-        return { nacp, icon, source, iconSource: icon ? source : null, ...controlDetails(nacp) };
+        const result = { nacp, icon, source, iconSource: icon ? source : null,
+          metadataPath: prefix + '/control.nacp', ...controlDetails(nacp) };
+        if (attempt) { attempt.status = 'read'; attempt.control = controlSummary(result); }
+        return result;
       } catch (error) {
+        if (attempt) { attempt.status = 'error'; attempt.stage = stage; attempt.error = errorDetails(error); }
         if (!error.nativeResult) throw error;
         return null;
       }
@@ -554,27 +671,16 @@ async function controlName(context, game) {
 
 // Check installed Program[1] by its NCA identity, without mounting any game filesystems.
 // A second program alone is not enough: ordinary Switch games can also be multi-program.
+// A Switch 2 Edition card may instead publish the Switch 2 program as program 0 of
+// its card update, so check that too.
 async function hasSwitch2Edition(context, game, updates) {
   if (!game.title.startsWith('01')) return false;
 
   const { s, root, domain, shouldStop = () => false } = context;
   const patchTitle = (BigInt('0x' + game.title) + 0x800n).toString(16).padStart(16, '0');
-  const candidates = updates
-    .filter((update) => update.contentTitle === patchTitle)
-    .map((update) => ({ storage: update.storage, update }));
-  candidates.push(...game.storages.map((storage) => ({ storage })));
-
-  for (const candidate of candidates) {
-    throwIfCancelled(shouldStop);
-    let source;
-    try {
-      source = await resolveProgramContent({ ...context, title: game.title, ...candidate, programIndex: 1 });
-    } catch (error) {
-      // ContentNotFound / ContentMetaNotFound, or an unavailable removable storage.
-      if ([0xa05, 0xe05, ...inactive].includes(error.nativeResult?.canonical)) continue;
-      throw error;
-    }
-
+  const absent = (error) => [0xa05, 0xe05, ...inactive].includes(error.nativeResult?.canonical);
+  const programId = async (candidate, programIndex) => {
+    const source = await resolveProgramContent({ ...context, title: game.title, ...candidate, programIndex });
     const filename = Buffer.alloc(0x301);
     filename.write(source.contentPath);
     await s.write(s.base + 0x2000, filename);
@@ -582,9 +688,36 @@ async function hasSwitch2Edition(context, game, updates) {
       s, 'Check installed Switch 2 Edition', root,
       pathRequest(618, Buffer.from([source.attributes]), s.base + 0x2000),
     ), 'Check installed Switch 2 Edition');
-    const programId = identity.data.readBigUInt64LE().toString(16).padStart(16, '0');
-    if (programId.startsWith('04')) return true;
+    return identity.data.readBigUInt64LE().toString(16).padStart(16, '0');
+  };
+
+  const candidates = updates
+    .filter((update) => update.contentTitle === patchTitle)
+    .map((update) => ({ storage: update.storage, update }));
+  candidates.push(...game.storages.map((storage) => ({ storage })));
+
+  for (const candidate of candidates) {
+    throwIfCancelled(shouldStop);
+    try {
+      if ((await programId(candidate, 1)).startsWith('04')) return true;
+    } catch (error) {
+      // ContentNotFound / ContentMetaNotFound, or an unavailable removable storage.
+      if (absent(error)) continue;
+      throw error;
+    }
   }
+
+  for (const update of updates) {
+    if (update.contentTitle !== patchTitle || update.storage !== 2) continue;
+    throwIfCancelled(shouldStop);
+    try {
+      if ((await programId({ storage: update.storage, update }, 0)).startsWith('04')) return true;
+    } catch (error) {
+      if (absent(error)) continue;
+      throw error;
+    }
+  }
+
   return false;
 }
 

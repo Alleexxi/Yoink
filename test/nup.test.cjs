@@ -6,7 +6,7 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { zstdDecompressSync } = require('node:zlib');
 const { test } = require('node:test');
-const { packNup } = require('../engine/nup.cjs');
+const { packNup, planPackages } = require('../engine/nup.cjs');
 const { FtpClient } = require('../engine/ftp-client.cjs');
 
 const hash = (bytes) => createHash('sha256').update(bytes).digest();
@@ -145,6 +145,60 @@ function fixture() {
   return { files, views, control };
 }
 
+function cardUpdateFixture() {
+  const data = fixture();
+  const source = { version: 720896, contentTitle: '0100abcd00010800', metaType: 0x81,
+    runtimeProgramId: '0400abcd00010000' };
+  data.views = data.views.filter((view) => !view.path.startsWith('/updates/'));
+  for (const view of data.views.filter((view) => view.path.startsWith('/switch2/'))) view.source = source;
+  const prefix = '/switch2/updates/720896';
+  const image = Buffer.from('program 0edition primary');
+  data.files.set(prefix + '/romfs.img', image);
+  Object.assign(data.views.find((view) => view.path === prefix + '/romfs'), {
+    size: image.length,
+    entries: [
+      { path: '/edition.txt', type: 'file', offset: 0, size: 9 },
+      { path: '/shared.txt', type: 'file', offset: 9, size: image.length - 9 },
+    ],
+  });
+  data.files.get(prefix + '/exefs/main.npdm').writeBigUInt64LE(BigInt('0x' + source.runtimeProgramId), 0x10);
+  return data;
+}
+
+function replaceRomfs(data, prefix, source, contents) {
+  let offset = 0;
+  const chunks = [];
+  const entries = Object.entries(contents).map(([filename, value]) => {
+    const bytes = Buffer.from(value);
+    const entry = { path: filename, type: 'file', offset, size: bytes.length };
+    offset += bytes.length; chunks.push(bytes); return entry;
+  });
+  const view = { path: prefix + '/romfs', source, size: offset, entries };
+  data.files.set(view.path + '.img', Buffer.concat(chunks));
+  data.views = data.views.filter((item) => item.path !== view.path);
+  data.views.push(view);
+}
+
+function unrealCardFixture() {
+  const data = cardUpdateFixture();
+  data.views = data.views.filter((view) => !view.path.startsWith('/dlc/'));
+  const programSource = data.views.find((view) => view.path.startsWith('/switch2/')).source;
+  replaceRomfs(data, '/switch2/updates/720896', programSource, {
+    '/__chunks': '1', '/Carrot4/Content/Paks/pakchunk0-Sage.pak': 'main pak',
+    '/Carrot4/Content/Paks/pakchunk0-Sage.ucas': 'main data',
+    '/Carrot4/Content/Paks/pakchunk0-Sage.utoc': 'main index',
+  });
+  const addonFiles = {
+    '/__chunks_1': '1', '/Carrot4/Content/Paks/pakchunk1-Sage.pak': 'DLC pak',
+    '/Carrot4/Content/Paks/pakchunk1-Sage.ucas': 'DLC data',
+    '/Carrot4/Content/Paks/pakchunk1-Sage.utoc': 'DLC index',
+  };
+  replaceRomfs(data, '/dlc/' + addonId + '/0', {
+    version: 0, contentTitle: addonId, runtimeProgramId: addonId, metaType: 0x82,
+  }, addonFiles);
+  return { data, addonFiles };
+}
+
 function readArchive(bytes) {
   assert.equal(bytes.subarray(0, 4).toString('hex'), '4e555001');
   assert.equal(Number(bytes.readBigUInt64LE(0x40)), bytes.length);
@@ -263,6 +317,238 @@ test('DLC patch identity and layering follow metadata even when its ID sorts bef
   assert.equal(s1.find((pack) => pack.kind === 3).id, addonId);
   const s2 = readArchive(await fs.readFile(output.replace('.nup', '-switch2.nup')));
   assert.equal(s2.find((pack) => pack.kind === 0).romfs.get('/shared.txt').toString(), 'patched upgrade');
+});
+
+test('a card update carrying the Switch 2 program becomes the edition primary', async (t) => {
+  const data = cardUpdateFixture();
+  const server = await ftpServer(t, data.files);
+  const output = path.join(await directory(t), 'card.nup');
+  await packNup({ ...server, ...data, title: baseId, output, edition: 'switch2' });
+  const packages = readArchive(await fs.readFile(output));
+  const program = packages.find((pack) => pack.kind === 0);
+  assert.equal(program.id, '0400abcd00010000');
+  assert.equal(program.version, 720896);
+  assert.equal(program.tags.get(5).toString(), data.control.switch2.name);
+  assert.equal(program.romfs.get('/edition.txt').toString(), 'program 0');
+  assert.equal(program.romfs.get('/shared.txt').toString(), 'patched upgrade');
+  assert.ok(!program.romfs.has('/big.txt'));
+  assert.ok(!program.romfs.has('/deleted.txt'));
+  assert.ok(packages.every((pack) => pack.id !== baseId));
+  assert.ok(!server.requests.some((name) => name.startsWith('/updates/')));
+  assert.ok(!server.requests.some((name) => name.startsWith('/base/')));
+  assert.equal(server.requests.filter((name) => name === '/switch2/updates/720896/romfs.img').length, 1);
+});
+
+test('all mode titles a card update carrying program 0 as the Switch 2 application', async (t) => {
+  const data = cardUpdateFixture();
+  // Missing ACI0 must not make the packer fall back to the 0100... patch ID.
+  data.files.get('/switch2/updates/720896/exefs/main.npdm').fill(0);
+  const server = await ftpServer(t, data.files);
+  const output = path.join(await directory(t), 'card.nup');
+  await packNup({ ...server, ...data, title: baseId, output, edition: 'all' });
+  const packages = readArchive(await fs.readFile(output));
+  const update = packages.find((pack) => pack.kind === 1);
+  assert.equal(update.id, '0400abcd00010000');
+  assert.equal(update.version, 720896);
+  assert.equal(update.tags.get(5).toString(), data.control.switch2.name);
+  assert.ok(packages.some((pack) => pack.kind === 0 && pack.id === baseId));
+});
+
+test('both mode keeps the original base separate from a program 0 edition', async (t) => {
+  const data = cardUpdateFixture();
+  const server = await ftpServer(t, data.files);
+  const output = path.join(await directory(t), 'card.nup');
+  await packNup({ ...server, ...data, title: baseId, output, edition: 'both' });
+  const s1 = readArchive(await fs.readFile(output));
+  const s2 = readArchive(await fs.readFile(output.replace('.nup', '-switch2.nup')));
+  assert.equal(s1.filter((pack) => pack.kind <= 1).length, 1);
+  assert.equal(s1.find((pack) => pack.kind === 0).id, baseId);
+  assert.equal(s1.find((pack) => pack.kind === 0).tags.get(5).toString(), data.control.name);
+  assert.equal(s2.find((pack) => pack.kind === 0).id, '0400abcd00010000');
+  assert.equal(s2.find((pack) => pack.kind === 0).romfs.get('/shared.txt').toString(), 'patched upgrade');
+  assert.equal(server.requests.filter((name) => name === '/switch2/updates/720896/romfs.img').length, 1);
+});
+
+test('Switch 1 packing never transfers the program 0 edition', async (t) => {
+  const data = cardUpdateFixture();
+  const server = await ftpServer(t, data.files);
+  const output = path.join(await directory(t), 'card.nup');
+  await packNup({ ...server, ...data, title: baseId, output, edition: 'switch1' });
+  const packages = readArchive(await fs.readFile(output));
+  assert.equal(packages.filter((pack) => pack.kind <= 1).length, 1);
+  assert.equal(packages.find((pack) => pack.kind === 0).id, baseId);
+  assert.ok(!server.requests.some((name) => name.startsWith('/switch2/')));
+});
+
+test('a program 0 edition uses its own update control and tolerates missing edition control', async (t) => {
+  const nacp = Buffer.alloc(0x4000, 2);
+  nacp.writeBigUInt64LE(BigInt('0x0100abcd00011000'), 0x3070);
+  nacp.writeBigUInt64LE(BigInt('0x' + baseId), 0x3078);
+  for (const ownControl of [null, { name: 'Update program 0 control', version: '2.0.0',
+    nacp, icon: Buffer.from('official edition icon') }]) {
+    const data = cardUpdateFixture();
+    delete data.control.switch2;
+    data.updateControls = { '0100abcd00010800:720896': ownControl };
+    const server = await ftpServer(t, data.files);
+    const output = path.join(await directory(t), 'card.nup');
+    await packNup({ ...server, ...data, title: baseId, output, edition: 'switch2' });
+    const program = readArchive(await fs.readFile(output)).find((pack) => pack.kind === 0);
+    assert.equal(program.id, '0400abcd00010000');
+    assert.equal(program.tags.get(5).toString(), (ownControl || data.control).name);
+    assert.equal(program.tags.get(4).toString(), (ownControl || data.control).version);
+    assert.deepEqual(program.tags.get(2), (ownControl || data.control).nacp);
+    if (ownControl) {
+      assert.deepEqual(program.tags.get(3), ownControl.icon);
+      assert.equal(program.tags.get(2).readBigUInt64LE(0x3070), BigInt('0x0100abcd00011000'));
+      assert.equal(program.tags.get(2).readBigUInt64LE(0x3078), BigInt('0x' + baseId));
+    }
+  }
+});
+
+test('preferred Acd_1 metadata is written into the program 0 edition NUP instead of root metadata', async (t) => {
+  const content = require('../engine/content.cjs');
+  const { prepareControl } = require('../engine/prepare-control.cjs');
+  const data = cardUpdateFixture();
+  delete data.control.switch2;
+  const rootControl = { name: 'Pikmin 4', version: '2.0.0', nacp: Buffer.alloc(0x4000, 3), icon: Buffer.from('root icon') };
+  const editionControl = { name: 'Pikmin 4 – Nintendo Switch 2 Edition + Dandori Academy', version: '2.0.0',
+    nacp: Buffer.alloc(0x4000, 4), icon: Buffer.from('Acd_1 icon'), metadataPath: '/Acd_1/control.nacp' };
+  const originalControl = data.control;
+  t.mock.method(content, 'readControl', async (a, title, storages, options) =>
+    !options?.update ? originalControl : options.programIndex === 1 ? editionControl : rootControl);
+  const group = [{ contentTitle: '0100abcd00010800', version: 720896, storage: 2 }];
+  const metadata = await prepareControl({ attachment: {}, title: baseId,
+    base: { source: { storage: 2 } }, updateGroups: [group], baseUpdateGroups: [],
+    editionUpdateGroups: [group], shouldStop: () => false });
+  assert.equal(metadata.control, originalControl);
+  const server = await ftpServer(t, data.files);
+  const output = path.join(await directory(t), 'card.nup');
+  await packNup({ ...server, ...data, ...metadata, title: baseId, output, edition: 'switch2' });
+  const program = readArchive(await fs.readFile(output)).find((pack) => pack.kind === 0);
+  assert.equal(program.id, '0400abcd00010000');
+  assert.equal(program.tags.get(5).toString(), editionControl.name);
+  assert.deepEqual(program.tags.get(2), editionControl.nacp);
+  assert.deepEqual(program.tags.get(3), editionControl.icon);
+});
+
+test('the physical-card Unreal chunk DLC is retained intact alongside the Switch 2 program', async (t) => {
+  const { data, addonFiles } = unrealCardFixture();
+  const server = await ftpServer(t, data.files);
+  const output = path.join(await directory(t), 'card.nup');
+  await packNup({ ...server, ...data, title: baseId, output, edition: 'switch2' });
+  const packages = readArchive(await fs.readFile(output));
+  assert.equal(packages.length, 2);
+  const addon = packages.find((pack) => pack.kind === 2);
+  assert.equal(addon.id, addonId);
+  assert.equal(addon.romfs.size, 4);
+  for (const [filename, value] of Object.entries(addonFiles)) assert.equal(addon.romfs.get(filename).toString(), value);
+  assert.equal(packages.find((pack) => pack.kind === 0).id, '0400abcd00010000');
+  assert.equal(server.requests.filter((name) => name === '/dlc/' + addonId + '/0/romfs.img').length, 1);
+});
+
+test('experimental flattening copies all companion chunk files into the base and retains the DLC', async (t) => {
+  const { data, addonFiles } = unrealCardFixture();
+  const server = await ftpServer(t, data.files);
+  const output = path.join(await directory(t), 'merged.nup');
+  await packNup({ ...server, ...data, title: baseId, output, edition: 'switch2', flattenUnrealChunks: true });
+  const archive = await fs.readFile(output);
+  const packages = readArchive(archive);
+  assert.equal(packages.length, 2);
+  const program = packages.find((pack) => pack.kind === 0);
+  const addon = packages.find((pack) => pack.kind === 2);
+  assert.equal(program.id, '0400abcd00010000');
+  assert.equal(program.tags.get(5).toString(), data.control.switch2.name);
+  assert.equal(program.romfs.get('/Carrot4/Content/Paks/pakchunk0-Sage.ucas').toString(), 'main data');
+  assert.equal(program.romfs.size, 8);
+  assert.equal(addon.id, addonId);
+  for (const [filename, value] of Object.entries(addonFiles)) {
+    assert.equal(program.romfs.get(filename).toString(), value);
+    assert.equal(addon.romfs.get(filename).toString(), value);
+  }
+  assert.equal(server.requests.filter((name) => name === '/dlc/' + addonId + '/0/romfs.img').length, 1);
+  assert.ok(!server.requests.some((name) => name.startsWith('/base/')));
+  // Both package entries must reference one stored extent, not store the DLC
+  // payload twice just because it is visible in two places.
+  const tocAt = Number(archive.readBigUInt64LE(8));
+  const toc = archive.subarray(tocAt);
+  const fileAt = 0x30 + toc.readUInt32LE(4) * 0x40 + Number(toc.readBigUInt64LE(8)) * 0x18;
+  const digest = hash(Buffer.from('DLC data'));
+  const extents = [];
+  for (let i = 0; i < Number(toc.readBigUInt64LE(16)); i++) {
+    const at = fileAt + i * 0x50;
+    if (toc.subarray(at + 0x20, at + 0x40).equals(digest)) extents.push(toc.readBigUInt64LE(at + 0x10));
+  }
+  assert.equal(extents.length, 2);
+  assert.equal(extents[0], extents[1]);
+});
+
+test('both mode merges companion files only into the Switch 2 base and downloads DLC once', async (t) => {
+  const { data, addonFiles } = unrealCardFixture();
+  const server = await ftpServer(t, data.files);
+  const output = path.join(await directory(t), 'merged.nup');
+  await packNup({ ...server, ...data, title: baseId, output, edition: 'both', flattenUnrealChunks: true });
+  const s1 = readArchive(await fs.readFile(output));
+  const s2 = readArchive(await fs.readFile(output.replace('.nup', '-switch2.nup')));
+  const original = s1.find((pack) => pack.kind === 0);
+  const edition = s2.find((pack) => pack.kind === 0);
+  assert.equal(original.id, baseId);
+  assert.equal(edition.id, '0400abcd00010000');
+  for (const filename of Object.keys(addonFiles)) {
+    assert.ok(!original.romfs.has(filename));
+    assert.ok(edition.romfs.has(filename));
+    assert.ok(s1.find((pack) => pack.kind === 2).romfs.has(filename));
+    assert.ok(s2.find((pack) => pack.kind === 2).romfs.has(filename));
+  }
+  assert.equal(server.requests.filter((name) => name === '/dlc/' + addonId + '/0/romfs.img').length, 1);
+});
+
+test('all and Switch 1 modes retain separate packages even when companion flattening is enabled', () => {
+  for (const edition of ['switch1', 'all']) {
+    const { data } = unrealCardFixture();
+    const packs = planPackages(data.views, baseId, edition, { flattenUnrealChunks: true });
+    const addon = packs.find((pack) => pack.kind === 2);
+    assert.equal(addon.romfsLayers[0].files.length, 4);
+    for (const pack of packs.filter((pack) => pack.kind <= 1)) {
+      assert.ok(pack.romfsLayers.every((layer) => !layer.ftpPath.startsWith('/dlc/')));
+    }
+  }
+});
+
+test('companion flattening rejects mismatched projects, platforms, markers and incomplete chunks', () => {
+  for (const change of ['project', 'platform', 'marker', 'ucas', 'primary-marker', 'extra-file']) {
+    const { data } = unrealCardFixture();
+    const addon = data.views.find((view) => view.path.startsWith('/dlc/'));
+    const primary = data.views.find((view) => view.path.startsWith('/switch2/') && view.path.endsWith('/romfs'));
+    if (change === 'project') for (const entry of addon.entries) entry.path = entry.path.replace('/Carrot4/', '/OtherGame/');
+    if (change === 'platform') for (const entry of addon.entries) entry.path = entry.path.replace('-Sage.', '-Switch.');
+    if (change === 'marker') addon.entries = addon.entries.filter((entry) => entry.path !== '/__chunks_1');
+    if (change === 'ucas') addon.entries = addon.entries.filter((entry) => !entry.path.endsWith('.ucas'));
+    if (change === 'primary-marker') primary.entries = primary.entries.filter((entry) => entry.path !== '/__chunks');
+    if (change === 'extra-file') addon.entries.push({ path: '/ordinary-addon.txt', type: 'file', offset: 0, size: 0 });
+    const packs = planPackages(data.views, baseId, 'switch2', { flattenUnrealChunks: true });
+    assert.equal(packs.length, 2, change);
+    assert.ok(packs[0].romfsLayers.every((layer) => !layer.ftpPath.startsWith('/dlc/')), change);
+  }
+});
+
+test('the documented environment switch enables companion flattening without extra CLI options', (t) => {
+  const previous = process.env.YOINK_FLATTEN_UNREAL_CHUNKS;
+  process.env.YOINK_FLATTEN_UNREAL_CHUNKS = '1';
+  t.after(() => {
+    if (previous === undefined) delete process.env.YOINK_FLATTEN_UNREAL_CHUNKS;
+    else process.env.YOINK_FLATTEN_UNREAL_CHUNKS = previous;
+  });
+  const { data } = unrealCardFixture();
+  const packs = planPackages(data.views, baseId, 'switch2');
+  assert.equal(packs[0].romfsLayers.length, 2);
+  assert.equal(packs.find((pack) => pack.kind === 2).romfsLayers.length, 1);
+});
+
+test('a program 0 edition without its primary RomFS fails before transferring Switch 1 content', async (t) => {
+  const data = cardUpdateFixture();
+  data.views = data.views.filter((view) => view.path !== '/switch2/updates/720896/romfs');
+  await assert.rejects(packNup({ ...data, title: baseId,
+    output: path.join(await directory(t), 'card.nup'), edition: 'switch2' }), /missing Switch 2 program 0 RomFS/);
 });
 
 test('non-edition games fall back to normal base/update packing', async (t) => {
